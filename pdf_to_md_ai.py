@@ -14,6 +14,7 @@ PDF to Markdown —— AI 增强转换（Qwen 多模态）
 import argparse
 import base64
 import fitz  # PyMuPDF
+import io
 import os
 import re
 import sys
@@ -44,6 +45,10 @@ def get_client():
 
 AVAILABLE_MODELS = ["qwen3.5-flash", "qwen3.5-plus"]
 DEFAULT_MODEL = "qwen3.5-flash"
+MODEL_IMAGE_MAX_BYTES = 7_500_000
+DETECTION_IMAGE_MAX_SIDE = 1600
+OCR_IMAGE_MAX_SIDE = 2200
+MIN_MODEL_IMAGE_SIDE = 640
 
 
 # ── PDF 类型检测 ───────────────────────────────────────────────────
@@ -109,9 +114,216 @@ def render_page_to_image(page, dpi=200):
     return pix.tobytes("png")
 
 
+def _serialize_pil_image(image, fmt, **save_kwargs):
+    buffer = io.BytesIO()
+    image.save(buffer, format=fmt, **save_kwargs)
+    return buffer.getvalue()
+
+
+def prepare_image_for_model(image_bytes, *, max_side, max_bytes=MODEL_IMAGE_MAX_BYTES,
+                            min_side=MIN_MODEL_IMAGE_SIDE):
+    """将图片压缩到适合发送给视觉模型的尺寸与体积。
+
+    返回 (encoded_bytes, mime_type, (width, height))。
+    优先保留 PNG；若体积仍过大，则降尺度并回退到 JPEG。
+    """
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(image_bytes))
+    image.load()
+
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+
+    if hasattr(Image, "Resampling"):
+        resample = Image.Resampling.LANCZOS
+    else:
+        resample = Image.LANCZOS
+
+    current = image
+    current_max_side = min(max(image.size), max_side)
+
+    while True:
+        if max(current.size) > current_max_side:
+            scale = current_max_side / max(current.size)
+            resized_size = (
+                max(1, int(round(current.width * scale))),
+                max(1, int(round(current.height * scale))),
+            )
+            candidate = current.resize(resized_size, resample)
+        else:
+            candidate = current
+
+        png_bytes = _serialize_pil_image(candidate, "PNG", optimize=True)
+        if len(png_bytes) <= max_bytes:
+            return png_bytes, "image/png", candidate.size
+
+        jpeg_source = candidate.convert("RGB") if candidate.mode != "RGB" else candidate
+        smallest_jpeg = None
+        for quality in (90, 85, 80, 75, 70, 60, 50, 40):
+            jpeg_bytes = _serialize_pil_image(
+                jpeg_source,
+                "JPEG",
+                quality=quality,
+                optimize=True,
+            )
+            if smallest_jpeg is None or len(jpeg_bytes) < len(smallest_jpeg):
+                smallest_jpeg = jpeg_bytes
+            if len(jpeg_bytes) <= max_bytes:
+                return jpeg_bytes, "image/jpeg", candidate.size
+
+        if max(candidate.size) <= min_side:
+            return smallest_jpeg, "image/jpeg", candidate.size
+
+        next_max_side = max(min_side, int(max(candidate.size) * 0.85))
+        if next_max_side >= max(candidate.size):
+            return smallest_jpeg, "image/jpeg", candidate.size
+
+        current = candidate
+        current_max_side = next_max_side
+
+
 def extract_page_text(page):
     """提取页面的纯文本"""
     return page.get_text().strip()
+
+
+def bbox_to_pixels(bbox, image_width, image_height):
+    """将 bbox 转为像素坐标。
+
+    优先按官方定位能力常见的归一化坐标 [0, 1000] 解释；
+    若超出范围，则回退为绝对像素坐标，兼容旧测试输出。
+    """
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+
+    if all(0 <= v <= 1000 for v in (x1, y1, x2, y2)):
+        x1 = x1 / 1000 * image_width
+        x2 = x2 / 1000 * image_width
+        y1 = y1 / 1000 * image_height
+        y2 = y2 / 1000 * image_height
+
+    x1, x2 = sorted((int(round(x1)), int(round(x2))))
+    y1, y2 = sorted((int(round(y1)), int(round(y2))))
+
+    x1 = max(0, min(image_width, x1))
+    x2 = max(0, min(image_width, x2))
+    y1 = max(0, min(image_height, y1))
+    y2 = max(0, min(image_height, y2))
+    return x1, y1, x2, y2
+
+
+def _normalize_bbox_to_1000(bbox, image_size, *, from_pixels=False):
+    """统一将 bbox 转为 [0, 1000] 归一化坐标。"""
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+
+    if image_size and (from_pixels or any(v > 1000 for v in (x1, y1, x2, y2))):
+        width, height = image_size
+        x1 = x1 / width * 1000
+        x2 = x2 / width * 1000
+        y1 = y1 / height * 1000
+        y2 = y2 / height * 1000
+
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+    return [
+        max(0.0, min(1000.0, x1)),
+        max(0.0, min(1000.0, y1)),
+        max(0.0, min(1000.0, x2)),
+        max(0.0, min(1000.0, y2)),
+    ]
+
+
+def parse_figure_detection_response(raw_text, image_size):
+    """解析模型返回的 JSON 检测结果，兼容 bbox / bbox_2d。"""
+    import json
+
+    raw = raw_text.strip()
+    raw = re.sub(r'^```(?:json)?\s*', '', raw)
+    raw = re.sub(r'\s*```$', '', raw)
+
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    figures = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        bbox_key = None
+        if "bbox" in item:
+            bbox_key = "bbox"
+        elif "bbox_2d" in item:
+            bbox_key = "bbox_2d"
+
+        if bbox_key is None:
+            continue
+
+        bbox = item.get(bbox_key)
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        if not all(isinstance(v, (int, float)) for v in bbox):
+            continue
+
+        figures.append({
+            "bbox": _normalize_bbox_to_1000(
+                bbox,
+                image_size,
+                from_pixels=(bbox_key == "bbox_2d"),
+            ),
+            "desc": item.get("desc") or item.get("label") or "",
+        })
+
+    return figures
+
+
+def parse_qwenvl_markdown_figures(raw_text, image_size):
+    """解析 qwenvl markdown 中的图片坐标注释。"""
+    raw = raw_text.strip()
+    raw = re.sub(r'^```(?:markdown)?\s*', '', raw)
+    raw = re.sub(r'\s*```$', '', raw)
+
+    figures = []
+    seen = set()
+    for match in re.finditer(r'<!--\s*Image\s*\(([^)]+)\)\s*-->', raw, flags=re.IGNORECASE):
+        parts = [part.strip() for part in match.group(1).split(',')]
+        if len(parts) != 4:
+            continue
+        try:
+            pixel_bbox = [float(part) for part in parts]
+        except ValueError:
+            continue
+
+        norm_bbox = _normalize_bbox_to_1000(pixel_bbox, image_size, from_pixels=True)
+        bbox_key = tuple(int(round(v)) for v in norm_bbox)
+        if bbox_key in seen:
+            continue
+        seen.add(bbox_key)
+        figures.append({"bbox": norm_bbox, "desc": ""})
+
+    return figures
+
+
+def _request_qwenvl_markdown(client, model, image_bytes, image_mime):
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {
+                    "url": f"data:{image_mime};base64,{base64.b64encode(image_bytes).decode()}"
+                }},
+                {"type": "text", "text": "qwenvl markdown"},
+            ]},
+        ],
+        temperature=0.1,
+        max_tokens=4096,
+        extra_body={"enable_thinking": False},
+    )
+    return response.choices[0].message.content.strip()
 
 
 def extract_and_save_images(doc, page, page_num, images_dir):
@@ -133,6 +345,409 @@ def extract_and_save_images(doc, page, page_num, images_dir):
     return saved
 
 
+def _merge_ai_and_embedded_images(page, doc, ai_filenames, ai_pixel_bboxes, embedded_filenames,
+                                    page_png_bytes, images_dir):
+    """合并AI检测图和嵌入图，去除被AI图覆盖的嵌入图。
+
+    ai_pixel_bboxes: 成功裁切的AI图的像素坐标列表 [(x1,y1,x2,y2), ...]
+    返回去重后的图片文件名列表（AI图在前，不重叠的嵌入图在后）。
+    被AI覆盖的嵌入图文件会被删除以避免冗余。
+    """
+    from PIL import Image
+
+    if not ai_filenames or not embedded_filenames:
+        return ai_filenames + embedded_filenames
+
+    img = Image.open(io.BytesIO(page_png_bytes))
+    scale_x = img.width / page.rect.width
+    scale_y = img.height / page.rect.height
+
+    # 获取嵌入图的页面位置
+    image_list = page.get_images(full=True)
+    kept_embedded = []
+    for idx, filename in enumerate(embedded_filenames):
+        if idx >= len(image_list):
+            kept_embedded.append(filename)
+            continue
+        xref = image_list[idx][0]
+        try:
+            rects = page.get_image_rects(xref)
+            if not rects:
+                kept_embedded.append(filename)
+                continue
+            rect = rects[0]
+            # PDF坐标(pt) → 渲染像素坐标
+            ex1 = rect.x0 * scale_x
+            ey1 = rect.y0 * scale_y
+            ex2 = rect.x1 * scale_x
+            ey2 = rect.y1 * scale_y
+            emb_area = max((ex2 - ex1) * (ey2 - ey1), 1)
+
+            # 检查是否被某个AI图覆盖 >50%
+            is_covered = False
+            for ax1, ay1, ax2, ay2 in ai_pixel_bboxes:
+                ix1, iy1 = max(ex1, ax1), max(ey1, ay1)
+                ix2, iy2 = min(ex2, ax2), min(ey2, ay2)
+                if ix1 < ix2 and iy1 < iy2:
+                    inter = (ix2 - ix1) * (iy2 - iy1)
+                    if inter / emb_area > 0.50:
+                        is_covered = True
+                        break
+            if is_covered:
+                # 删除被覆盖的嵌入图文件
+                try:
+                    os.remove(os.path.join(images_dir, filename))
+                except OSError:
+                    pass
+            else:
+                kept_embedded.append(filename)
+        except Exception:
+            kept_embedded.append(filename)
+
+    return ai_filenames + kept_embedded
+
+
+def _merge_figure_lists(*fig_lists):
+    """合并多个 figure 列表，去除 bbox 重叠度 > 50% 的重复项。"""
+    merged = []
+    for figs in fig_lists:
+        for fig in figs:
+            bbox = fig["bbox"]
+            is_dup = False
+            for existing in merged:
+                eb = existing["bbox"]
+                # 计算交集面积 / 较小框面积
+                ix1 = max(bbox[0], eb[0])
+                iy1 = max(bbox[1], eb[1])
+                ix2 = min(bbox[2], eb[2])
+                iy2 = min(bbox[3], eb[3])
+                if ix1 < ix2 and iy1 < iy2:
+                    inter = (ix2 - ix1) * (iy2 - iy1)
+                    area_a = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                    area_b = (eb[2] - eb[0]) * (eb[3] - eb[1])
+                    min_area = min(area_a, area_b)
+                    if min_area > 0 and inter / min_area > 0.50:
+                        is_dup = True
+                        break
+            if not is_dup:
+                merged.append(fig)
+    return merged
+
+
+def detect_page_figures(client, model, page_png_bytes, page_num):
+    """用 Qwen 视觉定位检测扫描页中的图片/图表区域。
+
+    返回 [{"bbox": [x1,y1,x2,y2], "desc": "描述"}] 列表。
+    坐标优先使用归一化区间 [0, 1000]，便于映射回不同分辨率。
+
+    策略：JSON bbox + qwenvl markdown 双路检测，合并去重结果，提高召回率。
+    JSON bbox 检测失败时会重试一次。
+    """
+    detect_bytes, detect_mime, detect_size = prepare_image_for_model(
+        page_png_bytes,
+        max_side=DETECTION_IMAGE_MAX_SIDE,
+    )
+
+    # ── 路径1：JSON bbox（prompt 可控，精度更高）──
+    prompt = (
+        "<task>检测扫描书页中的视觉元素，返回精确坐标。</task>\n"
+        "\n"
+        "<target_elements>\n"
+        "  照片、插图、图表、图形、地图、波形图、示意图、书法作品、绘画\n"
+        "</target_elements>\n"
+        "\n"
+        "<exclude>\n"
+        "  <item>纯文字行（正文段落、图题、图注、标题）</item>\n"
+        "  <item>页眉、页脚、页码</item>\n"
+        "  <item>表格（有边框的文字表格）</item>\n"
+        "  <item>条形码、装饰线</item>\n"
+        "</exclude>\n"
+        "\n"
+        "<precision_rules>\n"
+        "  <rule>bbox 必须覆盖视觉元素的完整区域——从左边界到右边界、从上边界到下边界</rule>\n"
+        "  <rule>不要只框住图片的局部或一角，必须包含整张图片</rule>\n"
+        "  <rule>如果图片上方有文字段落，y1 从图片顶边开始，不包含文字</rule>\n"
+        "  <rule>如果图片下方有文字段落，y2 到图片底边结束，不包含文字</rule>\n"
+        "  <rule>x1 和 x2 必须覆盖图片的完整宽度</rule>\n"
+        "  <rule>宁可在边缘稍微留白，也不要截掉图片的任何部分</rule>\n"
+        "  <rule>封面页、扉页的装饰性背景不算图片，不要框选</rule>\n"
+        "</precision_rules>\n"
+        "\n"
+        "<output_format>\n"
+        '  返回 JSON 数组: [{"bbox": [x1, y1, x2, y2], "desc": "简短描述"}]\n'
+        "  坐标系: 归一化 [0, 1000]，左上角(0,0)，右下角(1000,1000)\n"
+        "  无视觉元素时返回: []\n"
+        "  只输出 JSON，不要其他文字。\n"
+        "</output_format>"
+    )
+
+    json_figures = []
+    for attempt in range(2):  # 最多重试一次
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:{detect_mime};base64,{base64.b64encode(detect_bytes).decode()}"
+                        }},
+                        {"type": "text", "text": prompt},
+                    ]},
+                ],
+                temperature=0.1 + attempt * 0.15,  # 重试时稍微提高温度
+                max_tokens=1024,
+                extra_body={"enable_thinking": False},
+            )
+            raw = response.choices[0].message.content.strip()
+            json_figures = parse_figure_detection_response(raw, detect_size)
+            if json_figures:
+                break
+        except Exception:
+            pass
+
+    # ── 路径2：qwenvl markdown 兜底 / 补充 ──
+    qwenvl_figures = []
+    try:
+        raw_qwenvl = _request_qwenvl_markdown(client, model, detect_bytes, detect_mime)
+        qwenvl_figures = parse_qwenvl_markdown_figures(raw_qwenvl, detect_size)
+    except Exception:
+        pass
+
+    # 合并两路结果，去重
+    all_figures = _merge_figure_lists(json_figures, qwenvl_figures)
+    return all_figures
+
+
+def _refine_bbox_with_pixels(img, x1, y1, x2, y2):
+    """用像素分析扩展/收缩 bbox，使其精确匹配图片区域的实际边界。
+
+    策略：
+    1. 从 bbox 中心区域出发，确认存在非文字内容（图片像素）
+    2. 向上下扩展 bbox，直到碰到连续的文字/空白行
+    3. 向左右扩展 bbox，直到碰到连续的空白列
+    4. 收缩 bbox 边缘的纯文字/空白区域
+
+    返回修正后的 (x1, y1, x2, y2)。
+    """
+    import numpy as np
+
+    arr = np.array(img.convert("L"))
+    h, w = arr.shape
+
+    # ── Y 方向精修（基于行白色像素比）──
+    col_start = max(0, x1)
+    col_end = min(w, x2)
+    if col_end - col_start < 30:
+        return x1, y1, x2, y2
+
+    strip = arr[:, col_start:col_end]
+    white_ratio = (strip > 230).mean(axis=1)
+    is_text = white_ratio > 0.55
+
+    # 找 bbox 中心区域的"图片行"作为种子
+    cy = (y1 + y2) // 2
+    if is_text[min(cy, h - 1)]:
+        best_s, best_e, best_l = cy, cy, 0
+        s = None
+        for i in range(max(0, y1), min(h, y2)):
+            if not is_text[i]:
+                if s is None:
+                    s = i
+            else:
+                if s is not None:
+                    if i - s > best_l:
+                        best_s, best_e, best_l = s, i, i - s
+                    s = None
+        if s is not None and min(h, y2) - s > best_l:
+            best_s, best_e, best_l = s, min(h, y2), min(h, y2) - s
+        if best_l < 15:
+            # Y 方向找不到足够的"图片行"种子，保留原始 Y 不精修，
+            # 但仍然跳到 X 方向精修（不要直接 return）
+            new_y1, new_y2 = y1, y2
+            # 跳过 Y 方向扩展，直接进入 X 精修
+            _skip_y_expansion = True
+        else:
+            cy = (best_s + best_e) // 2
+            _skip_y_expansion = False
+    else:
+        _skip_y_expansion = False
+
+    if not _skip_y_expansion:
+        # 从种子行向上扩展
+        new_y1 = cy
+        consecutive_text = 0
+        for i in range(cy, -1, -1):
+            if is_text[i]:
+                consecutive_text += 1
+                if consecutive_text >= 8:
+                    new_y1 = i + consecutive_text
+                    break
+            else:
+                consecutive_text = 0
+                new_y1 = i
+        else:
+            new_y1 = 0
+
+        # 从种子行向下扩展
+        new_y2 = cy
+        consecutive_text = 0
+        for i in range(cy, h):
+            if is_text[i]:
+                consecutive_text += 1
+                if consecutive_text >= 8:
+                    new_y2 = i - consecutive_text + 1
+                    break
+            else:
+                consecutive_text = 0
+                new_y2 = i + 1
+        else:
+            new_y2 = h
+
+        new_y1 = max(0, new_y1 - 3)
+        new_y2 = min(h, new_y2 + 3)
+
+    # ── X 方向精修（基于列白色像素比）──
+    row_start = max(0, new_y1)
+    row_end = min(h, new_y2)
+    if row_end - row_start < 30:
+        return x1, new_y1, x2, new_y2
+
+    h_strip = arr[row_start:row_end, :]
+    col_white_ratio = (h_strip > 230).mean(axis=0)
+
+    # 判断原始 bbox 是否在 X 方向明显过窄（可能是模型只检测到了图片局部）
+    bbox_w = x2 - x1
+    bbox_h = new_y2 - new_y1
+    narrow_bbox = bbox_w < w * 0.35 and bbox_h > bbox_w * 1.5
+
+    if narrow_bbox:
+        # 对于明显过窄的 bbox，采用更激进的扩展策略：
+        # 从 bbox 区域的 Y 范围内, 找到所有"有内容"的列（白色比 < 0.98）
+        # 使用更宽松的空白判定和更大的连续空白阈值
+        content_col = col_white_ratio < 0.98
+        # 找最左和最右的有内容列
+        content_cols = np.where(content_col)[0]
+        if len(content_cols) > 5:
+            new_x1 = int(content_cols[0])
+            new_x2 = int(content_cols[-1]) + 1
+        else:
+            new_x1, new_x2 = x1, x2
+    else:
+        is_blank_col = col_white_ratio > 0.95  # 空白列阈值（几乎纯白）
+
+        cx = (x1 + x2) // 2
+        cx = max(0, min(w - 1, cx))
+
+        # 从中心向左扩展，找到图片左边界
+        # 使用较大的连续空白阈值(20列)避免误判波形图等细密内容的间隙
+        new_x1 = cx
+        consecutive_blank = 0
+        for i in range(cx, -1, -1):
+            if is_blank_col[i]:
+                consecutive_blank += 1
+                if consecutive_blank >= 20:
+                    new_x1 = i + consecutive_blank
+                    break
+            else:
+                consecutive_blank = 0
+                new_x1 = i
+
+        # 从中心向右扩展
+        new_x2 = cx
+        consecutive_blank = 0
+        for i in range(cx, w):
+            if is_blank_col[i]:
+                consecutive_blank += 1
+                if consecutive_blank >= 20:
+                    new_x2 = i - consecutive_blank + 1
+                    break
+            else:
+                consecutive_blank = 0
+                new_x2 = i + 1
+        else:
+            new_x2 = w
+
+    # X 方向取精修结果和原始 bbox 的并集（宁大勿小，避免截掉图片内容）
+    new_x1 = min(new_x1, x1)
+    new_x2 = max(new_x2, x2)
+    new_x1 = max(0, new_x1 - 3)
+    new_x2 = min(w, new_x2 + 3)
+
+    return new_x1, new_y1, new_x2, new_y2
+
+
+def crop_and_save_figures(page_png_bytes, figures, page_num, images_dir):
+    """根据检测到的 bbox 裁切图片区域并保存。返回 [(文件名, 描述, 像素bbox)] 列表。"""
+    from PIL import Image
+    import numpy as np
+
+    img = Image.open(io.BytesIO(page_png_bytes))
+    saved = []
+    page_area = img.width * img.height
+    for fig_idx, fig in enumerate(figures):
+        x1, y1, x2, y2 = bbox_to_pixels(fig["bbox"], img.width, img.height)
+        desc = fig.get("desc", "")
+        # 添加少量 padding
+        padding = 5
+        x1 = max(0, x1 - padding)
+        y1 = max(0, y1 - padding)
+        x2 = min(img.width, x2 + padding)
+        y2 = min(img.height, y2 + padding)
+        fig_w = x2 - x1
+        fig_h = y2 - y1
+        # 跳过太小的区域（可能是误检）
+        if fig_w < 30 or fig_h < 30:
+            continue
+        fig_area = fig_w * fig_h
+        if fig_area / page_area < 0.005:
+            continue
+        # 跳过占页面面积过大的区域（>70% 通常是整页误检）
+        if fig_area / page_area > 0.70:
+            continue
+        # 用像素分析精确扩展/收缩 bbox
+        x1, y1, x2, y2 = _refine_bbox_with_pixels(img, x1, y1, x2, y2)
+        fig_w = x2 - x1
+        fig_h = y2 - y1
+        # 再次检查扩展后面积
+        fig_area = fig_w * fig_h
+        if fig_area / page_area > 0.70:
+            continue
+        # 跳过极窄长条（宽高比异常，通常是边缘装饰误检）
+        aspect = fig_w / max(fig_h, 1)
+        if aspect < 0.15 or aspect > 6.5:
+            continue
+        # 扩展后仍然太小的跳过
+        if fig_w < 80 or fig_h < 80:
+            continue
+        cropped = img.crop((x1, y1, x2, y2))
+        # 过滤近乎全白的裁切（白色像素 >95% 说明是误裁空白区域）
+        arr = np.array(cropped.convert("L"))
+        if (arr > 240).mean() > 0.95:
+            continue
+        # IoU 去重：与已保存的图片比较，如果重叠 >50% 则跳过（避免近似重复）
+        cur_box = (x1, y1, x2, y2)
+        is_dup = False
+        for _, _, prev_box in saved:
+            ix1 = max(cur_box[0], prev_box[0])
+            iy1 = max(cur_box[1], prev_box[1])
+            ix2 = min(cur_box[2], prev_box[2])
+            iy2 = min(cur_box[3], prev_box[3])
+            if ix1 < ix2 and iy1 < iy2:
+                inter = (ix2 - ix1) * (iy2 - iy1)
+                area_cur = (cur_box[2] - cur_box[0]) * (cur_box[3] - cur_box[1])
+                area_prev = (prev_box[2] - prev_box[0]) * (prev_box[3] - prev_box[1])
+                union = area_cur + area_prev - inter
+                if union > 0 and inter / union > 0.5:
+                    is_dup = True
+                    break
+        if is_dup:
+            continue
+        filename = f"page{page_num + 1}_fig{fig_idx + 1}.png"
+        cropped.save(os.path.join(images_dir, filename))
+        saved.append((filename, desc, (x1, y1, x2, y2)))
+    return saved
+
+
 # ── 核心：调用 Qwen 多模态 ─────────────────────────────────────────
 
 SYSTEM_PROMPT_SCANNED = """\
@@ -151,7 +766,8 @@ SYSTEM_PROMPT_SCANNED = """\
 
 <rule id="figures">
 如果页面上有插图、图表等非文字内容：
-- 插图/图片：用 `<!-- 图：[简要描述] -->` 标注其位置和内容
+- 如果我提供了 <images> 列表中的图片文件名，在图出现的位置用 ![描述](images/文件名) 引用对应的图片
+- 如果没有提供图片文件名，用 `<!-- 图：[简要描述] -->` 标注其位置和内容
 - 表格：尽量转写为 Markdown 表格
 </rule>
 
@@ -252,14 +868,14 @@ def _build_outline(all_md_parts):
 
 def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenames,
                           page_num, total_pages, prev_md_tail="", outline="",
-                          pdf_type="digital"):
+                          pdf_type="digital", page_image_mime="image/png"):
     """调用 Qwen 多模态模型转换单页"""
 
     is_scanned = (pdf_type == "scanned")
     system_prompt = SYSTEM_PROMPT_SCANNED if is_scanned else SYSTEM_PROMPT
 
-    # 图片清单（扫描件不需要，因为没有可提取的内容图片）
-    if not is_scanned and image_filenames:
+    # 图片清单
+    if image_filenames:
         img_list = '\n'.join(f'    <img>{f}</img>' for f in image_filenames)
         img_section = (
             f"<images count=\"{len(image_filenames)}\">\n"
@@ -292,6 +908,9 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
 
     # 根据 PDF 类型选择不同的指令
     if is_scanned:
+        img_instructions = ""
+        if image_filenames:
+            img_instructions = f"    - 本页有 {len(image_filenames)} 张已裁切的图片；在图出现的位置用 ![描述](images/文件名) 引用\n"
         instructions = (
             f"  <instructions>\n"
             f"    - 精确 OCR 页面上的所有正文文字\n"
@@ -299,6 +918,7 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
             f"    - 【关键】查看 previous_page_tail，如果本页顶部的文字已经出现在 tail 中，跳过这些重复部分，从新内容开始\n"
             f"    - 合并因分页断开的句子，还原为通顺的段落\n"
             f"    - 忽略页眉、页脚、页码\n"
+            f"{img_instructions}"
             f"    - 直接输出 Markdown，不要解释\n"
             f"  </instructions>"
         )
@@ -331,7 +951,7 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
         {
             "type": "image_url",
             "image_url": {
-                "url": f"data:image/png;base64,{base64.b64encode(page_png_bytes).decode()}"
+                "url": f"data:{page_image_mime};base64,{base64.b64encode(page_png_bytes).decode()}"
             },
         },
         {
@@ -367,6 +987,10 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
         output_dir = Path(output_dir)
 
     images_dir = output_dir / "images"
+    # 清理旧的图片文件，避免前次运行的残留
+    if images_dir.exists():
+        for old_img in images_dir.glob("*.png"):
+            old_img.unlink()
     images_dir.mkdir(parents=True, exist_ok=True)
 
     client = get_client()
@@ -376,28 +1000,67 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
     # 检测 PDF 类型
     pdf_type = _detect_pdf_type(doc)
 
-    print(f"📄 正在转换: {pdf_path.name}")
-    print(f"📑 总页数: {total_pages}")
-    print(f"📋 类型: {pdf_type} ({'扫描件OCR' if pdf_type == 'scanned' else '数字PDF'})")
-    print(f"🤖 模型: {model}")
-    print(f"📁 输出目录: {output_dir}\n")
+    print(f"[*] 正在转换: {pdf_path.name}")
+    print(f"    总页数: {total_pages}")
+    print(f"    类型: {pdf_type} ({'扫描件OCR' if pdf_type == 'scanned' else '数字PDF'})")
+    print(f"    模型: {model}")
+    print(f"    输出目录: {output_dir}\n")
 
     all_md_parts = []
+    page_images_map = {}  # page_num -> [filename, ...] 跟踪每页裁切的图片
 
     for page_num in range(total_pages):
         page = doc[page_num]
 
         # 1. 渲染页面为图片
         page_png = render_page_to_image(page)
+        page_api_image, page_api_mime, _ = prepare_image_for_model(
+            page_png,
+            max_side=OCR_IMAGE_MAX_SIDE,
+        )
 
         # 2. 提取文本层
         page_text = extract_page_text(page)
 
-        # 3. 提取并保存嵌入的图片（扫描件跳过，因为图片是扫描条带）
+        # 3. 提取并保存图片
         if pdf_type == "scanned":
-            image_filenames = []
+            # 扫描件：用 AI 视觉定位检测页面中的图表/插图区域，裁切保存
+            try:
+                figures = detect_page_figures(client, model, page_png, page_num)
+            except Exception as e:
+                print(f"  ⚠ 第{page_num+1}页图片检测失败: {e}")
+                figures = []
+            if figures:
+                fig_results = crop_and_save_figures(page_png, figures, page_num, str(images_dir))
+                image_filenames = [f[0] for f in fig_results]
+                # 构建图片文件名→描述的映射，传给 OCR 调用
+                fig_desc_map = {f[0]: f[1] for f in fig_results}
+                print(f"[img:{len(image_filenames)}]", end=" ", flush=True)
+            else:
+                image_filenames = []
         else:
-            image_filenames = extract_and_save_images(doc, page, page_num, str(images_dir))
+            # 数字PDF：嵌入图片提取 + AI 视觉检测（混合策略，确保不丢失图片信息）
+            embedded_filenames = extract_and_save_images(doc, page, page_num, str(images_dir))
+
+            # AI 检测页面中的图表/图形区域（补充嵌入提取无法覆盖的矢量图/组合图）
+            try:
+                figures = detect_page_figures(client, model, page_png, page_num)
+            except Exception as e:
+                print(f"  ⚠ 第{page_num+1}页AI图片检测失败: {e}")
+                figures = []
+
+            if figures:
+                fig_results = crop_and_save_figures(page_png, figures, page_num, str(images_dir))
+                ai_filenames = [f[0] for f in fig_results]
+                ai_pixel_bboxes = [f[2] for f in fig_results]
+                # 合并：AI检测图 + 非重叠嵌入图（去除被AI覆盖的嵌入图）
+                image_filenames = _merge_ai_and_embedded_images(
+                    page, doc, ai_filenames, ai_pixel_bboxes, embedded_filenames,
+                    page_png, str(images_dir),
+                )
+                print(f"[AI:{len(ai_filenames)} embed:{len(embedded_filenames)}->{len(image_filenames) - len(ai_filenames)}]", end=" ", flush=True)
+            else:
+                image_filenames = embedded_filenames
 
         # 4. 构建滚动上下文：大纲 + 上一页末尾
         prev_tail = ""
@@ -407,17 +1070,18 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
             prev_tail = all_md_parts[-1][-tail_len:]
         outline = _build_outline(all_md_parts)
 
-        print(f"  🔄 第 {page_num + 1}/{total_pages} 页...", end=" ", flush=True)
+        print(f"  [{page_num + 1}/{total_pages}]", end=" ", flush=True)
         start = time.time()
         try:
             md_part = convert_page_with_ai(
-                client, model, page_png, page_text, image_filenames,
+                client, model, page_api_image, page_text, image_filenames,
                 page_num, total_pages,
                 prev_md_tail=prev_tail, outline=outline,
                 pdf_type=pdf_type,
+                page_image_mime=page_api_mime,
             )
             elapsed = time.time() - start
-            print(f"✅ ({elapsed:.1f}s)")
+            print(f"OK ({elapsed:.1f}s)")
         except Exception as e:
             elapsed = time.time() - start
             print(f"❌ ({elapsed:.1f}s) {e}")
@@ -425,8 +1089,17 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
             md_part = page_text if page_text else f"<!-- 第{page_num+1}页转换失败 -->"
 
         all_md_parts.append(md_part)
+        if image_filenames:
+            page_images_map[page_num] = image_filenames
 
     doc.close()
+
+    # 4.5 保底：检查每页裁切的图片是否都被模型引用了，未引用的追加到该页 MD 末尾
+    for pg, filenames in page_images_map.items():
+        md_part = all_md_parts[pg]
+        for fname in filenames:
+            if fname not in md_part:
+                all_md_parts[pg] += f"\n\n![](images/{fname})"
 
     # 5. 拼接所有页面
     md_content = "\n\n".join(all_md_parts)
@@ -442,14 +1115,14 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
 
     # 修复模型生成的坏图片引用格式，如 ![](images/page9[](images/page9_img1.png)
     md_content = re.sub(
-        r'!\[\]\(images/page\d+\[]\(images/(page\d+_img\d+\.png)\)',
+        r'!\[\]\(images/page\d+\[]\(images/(page\d+_(?:img|fig)\d+\.png)\)',
         r'![](images/\1)',
         md_content,
     )
 
     # 通用后处理：修复缺少 images/ 前缀的图片引用
     md_content = re.sub(
-        r'!\[([^\]]*)\]\((page\d+_img\d+\.png)\)',
+        r'!\[([^\]]*)\]\((page\d+_(?:img|fig)\d+\.png)\)',
         r'![\1](images/\2)',
         md_content,
     )
@@ -684,7 +1357,7 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
         f.write(md_content)
 
     img_count = len(list(images_dir.glob("*.png")))
-    print(f"\n🎉 转换完成！")
+    print(f"\n[DONE] 转换完成！")
     print(f"   Markdown: {md_path}")
     print(f"   图片: {images_dir} ({img_count}张)")
 
