@@ -347,11 +347,13 @@ def extract_and_save_images(doc, page, page_num, images_dir):
 
 def _merge_ai_and_embedded_images(page, doc, ai_filenames, ai_pixel_bboxes, embedded_filenames,
                                     page_png_bytes, images_dir):
-    """合并AI检测图和嵌入图，去除被AI图覆盖的嵌入图。
+    """合并AI检测图和嵌入图，双向去重。
 
     ai_pixel_bboxes: 成功裁切的AI图的像素坐标列表 [(x1,y1,x2,y2), ...]
-    返回去重后的图片文件名列表（AI图在前，不重叠的嵌入图在后）。
-    被AI覆盖的嵌入图文件会被删除以避免冗余。
+    返回去重后的图片文件名列表（不重叠的AI图 + 不重叠的嵌入图）。
+    双向去重逻辑：
+    1. AI裁切被嵌入图覆盖>50% → 移除AI裁切（嵌入图质量更高）
+    2. 嵌入图被AI裁切覆盖>50% → 移除嵌入图
     """
     from PIL import Image
 
@@ -362,49 +364,143 @@ def _merge_ai_and_embedded_images(page, doc, ai_filenames, ai_pixel_bboxes, embe
     scale_x = img.width / page.rect.width
     scale_y = img.height / page.rect.height
 
-    # 获取嵌入图的页面位置
+    # ── 第1步：计算所有嵌入图的像素坐标 ──
     image_list = page.get_images(full=True)
-    kept_embedded = []
+    embedded_pixel_bboxes = []  # 与 embedded_filenames 一一对应，None 表示无法获取
     for idx, filename in enumerate(embedded_filenames):
         if idx >= len(image_list):
-            kept_embedded.append(filename)
+            embedded_pixel_bboxes.append(None)
             continue
         xref = image_list[idx][0]
         try:
             rects = page.get_image_rects(xref)
             if not rects:
-                kept_embedded.append(filename)
+                embedded_pixel_bboxes.append(None)
                 continue
             rect = rects[0]
-            # PDF坐标(pt) → 渲染像素坐标
             ex1 = rect.x0 * scale_x
             ey1 = rect.y0 * scale_y
             ex2 = rect.x1 * scale_x
             ey2 = rect.y1 * scale_y
-            emb_area = max((ex2 - ex1) * (ey2 - ey1), 1)
-
-            # 检查是否被某个AI图覆盖 >50%
-            is_covered = False
-            for ax1, ay1, ax2, ay2 in ai_pixel_bboxes:
-                ix1, iy1 = max(ex1, ax1), max(ey1, ay1)
-                ix2, iy2 = min(ex2, ax2), min(ey2, ay2)
-                if ix1 < ix2 and iy1 < iy2:
-                    inter = (ix2 - ix1) * (iy2 - iy1)
-                    if inter / emb_area > 0.50:
-                        is_covered = True
-                        break
-            if is_covered:
-                # 删除被覆盖的嵌入图文件
-                try:
-                    os.remove(os.path.join(images_dir, filename))
-                except OSError:
-                    pass
-            else:
-                kept_embedded.append(filename)
+            embedded_pixel_bboxes.append((ex1, ey1, ex2, ey2))
         except Exception:
+            embedded_pixel_bboxes.append(None)
+
+    # ── 第2步：反向去重 — 移除被嵌入图覆盖的AI裁切 ──
+    kept_ai_indices = []
+    for ai_idx, (ax1, ay1, ax2, ay2) in enumerate(ai_pixel_bboxes):
+        ai_area = max((ax2 - ax1) * (ay2 - ay1), 1)
+        is_covered_by_embed = False
+        for eb in embedded_pixel_bboxes:
+            if eb is None:
+                continue
+            ex1, ey1, ex2, ey2 = eb
+            ix1, iy1 = max(ax1, ex1), max(ay1, ey1)
+            ix2, iy2 = min(ax2, ex2), min(ay2, ey2)
+            if ix1 < ix2 and iy1 < iy2:
+                inter = (ix2 - ix1) * (iy2 - iy1)
+                if inter / ai_area > 0.50:
+                    is_covered_by_embed = True
+                    break
+        if is_covered_by_embed:
+            fname = ai_filenames[ai_idx]
+            try:
+                os.remove(os.path.join(images_dir, fname))
+            except OSError:
+                pass
+            print(f"[{fname}:reject(与嵌入图重叠)]", end=" ", flush=True)
+        else:
+            kept_ai_indices.append(ai_idx)
+
+    kept_ai = [ai_filenames[i] for i in kept_ai_indices]
+    kept_ai_bboxes = [ai_pixel_bboxes[i] for i in kept_ai_indices]
+
+    # ── 第3步：正向去重 — 移除被(剩余)AI裁切覆盖的嵌入图 ──
+    kept_embedded = []
+    for idx, filename in enumerate(embedded_filenames):
+        eb = embedded_pixel_bboxes[idx]
+        if eb is None:
+            kept_embedded.append(filename)
+            continue
+        ex1, ey1, ex2, ey2 = eb
+        emb_area = max((ex2 - ex1) * (ey2 - ey1), 1)
+        is_covered = False
+        for ax1, ay1, ax2, ay2 in kept_ai_bboxes:
+            ix1, iy1 = max(ex1, ax1), max(ey1, ay1)
+            ix2, iy2 = min(ex2, ax2), min(ey2, ay2)
+            if ix1 < ix2 and iy1 < iy2:
+                inter = (ix2 - ix1) * (iy2 - iy1)
+                if inter / emb_area > 0.50:
+                    is_covered = True
+                    break
+        if is_covered:
+            try:
+                os.remove(os.path.join(images_dir, filename))
+            except OSError:
+                pass
+        else:
             kept_embedded.append(filename)
 
-    return ai_filenames + kept_embedded
+    return kept_ai + kept_embedded
+
+
+def _compute_image_positions(image_filenames, page_png_bytes, fig_bboxes=None, page=None):
+    """按页面纵向位置排序图片并计算位置百分比。
+
+    fig_bboxes: {filename: (x1,y1,x2,y2)} AI检测/裁切的像素坐标
+    page: PyMuPDF 页面对象（用于获取嵌入图位置）
+    返回 (sorted_filenames, positions_dict)，positions_dict: {filename: "~XX%"}
+    """
+    if not image_filenames:
+        return [], {}
+
+    from PIL import Image
+    pil_img = Image.open(io.BytesIO(page_png_bytes))
+    page_height = pil_img.height
+
+    items = []  # [(filename, y_center)]
+
+    for fname in image_filenames:
+        y_center = None
+
+        # 1. AI/crop bbox（像素坐标）
+        if fig_bboxes and fname in fig_bboxes:
+            bbox = fig_bboxes[fname]
+            y_center = (bbox[1] + bbox[3]) / 2
+
+        # 2. 嵌入图：从 PDF 页面获取位置
+        elif page is not None:
+            m = re.search(r'_img(\d+)\.png$', fname)
+            if m:
+                img_idx = int(m.group(1)) - 1  # 0-based
+                try:
+                    image_list = page.get_images(full=True)
+                    if img_idx < len(image_list):
+                        xref = image_list[img_idx][0]
+                        rects = page.get_image_rects(xref)
+                        if rects:
+                            scale_y = page_height / page.rect.height
+                            rect = rects[0]
+                            ey1 = rect.y0 * scale_y
+                            ey2 = rect.y1 * scale_y
+                            y_center = (ey1 + ey2) / 2
+                except Exception:
+                    pass
+
+        if y_center is None:
+            y_center = page_height / 2  # fallback
+
+        items.append((fname, y_center))
+
+    items.sort(key=lambda x: x[1])
+
+    sorted_filenames = [it[0] for it in items]
+    positions = {}
+    for fname, y_center in items:
+        pct = round(y_center / page_height * 100) if page_height > 0 else 50
+        positions[fname] = f"~{pct}%"
+
+    return sorted_filenames, positions
 
 
 def _merge_figure_lists(*fig_lists):
@@ -748,6 +844,296 @@ def crop_and_save_figures(page_png_bytes, figures, page_num, images_dir):
     return saved
 
 
+# ── AI 裁切验证与优化 ──────────────────────────────────────────────
+
+_MAX_CROP_VERIFY_ROUNDS = 2  # 防止死循环：最多验证+修正 2 轮
+
+
+def _draw_bbox_overlay(page_png_bytes, bboxes_px):
+    """在页面图片上绘制带编号的矩形框，供 AI 审查参考。"""
+    from PIL import Image, ImageDraw
+
+    img = Image.open(io.BytesIO(page_png_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    colors = [
+        (255, 0, 0), (0, 180, 0), (0, 0, 255), (255, 0, 255),
+        (255, 160, 0), (0, 200, 200), (128, 0, 255), (255, 128, 0),
+    ]
+    for idx, (x1, y1, x2, y2) in enumerate(bboxes_px):
+        color = colors[idx % len(colors)]
+        for d in range(3):
+            draw.rectangle([x1 - d, y1 - d, x2 + d, y2 + d], outline=color)
+        label = str(idx + 1)
+        draw.rectangle([x1, max(0, y1 - 22), x1 + 26, y1], fill=color)
+        draw.text((x1 + 5, max(0, y1 - 20)), label, fill=(255, 255, 255))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _ai_verify_crops(client, model, page_png_bytes, crop_results, page_num,
+                     images_dir, *, round_num=0, other_images=None):
+    """AI 验证裁切质量，返回每张裁切的动作列表。
+
+    crop_results: [(filename, desc, (x1,y1,x2,y2))]
+    other_images: 同页已有的其他图片文件名（如嵌入图），用于去重判断
+    返回 [{"index": N, "action": "accept"|"reject"|"adjust"|"split", ...}]
+    """
+    import json
+
+    if not crop_results:
+        return []
+
+    # 带编号框的页面图（用高分辨率，让 AI 看清楚内容边界）
+    bboxes_px = [cr[2] for cr in crop_results]
+    overlay_bytes = _draw_bbox_overlay(page_png_bytes, bboxes_px)
+    overlay_compressed, overlay_mime, _ = prepare_image_for_model(
+        overlay_bytes, max_side=OCR_IMAGE_MAX_SIDE,
+    )
+
+    # 裁切描述
+    crops_desc = []
+    for idx, (fname, desc, (x1, y1, x2, y2)) in enumerate(crop_results):
+        crops_desc.append(
+            f"  图{idx + 1}: {fname} | {x2 - x1}×{y2 - y1}px | 描述: {desc or '无'}"
+        )
+
+    # 构建多图内容：页面标注图 + 各裁切图
+    content = [
+        {"type": "image_url", "image_url": {
+            "url": f"data:{overlay_mime};base64,"
+                   f"{base64.b64encode(overlay_compressed).decode()}"
+        }},
+    ]
+    for fname, _, _ in crop_results:
+        crop_path = os.path.join(images_dir, fname)
+        if not os.path.exists(crop_path):
+            continue
+        with open(crop_path, "rb") as f:
+            crop_bytes = f.read()
+        crop_compressed, crop_mime, _ = prepare_image_for_model(
+            crop_bytes, max_side=800,
+        )
+        content.append({"type": "image_url", "image_url": {
+            "url": f"data:{crop_mime};base64,"
+                   f"{base64.b64encode(crop_compressed).decode()}"
+        }})
+
+    # 已有嵌入图信息（用于去重判断）
+    other_info = ""
+    if other_images:
+        other_info = (
+            f"\n注意：此页面已有 {len(other_images)} 张通过其他方式提取的图片：\n"
+            f"  {', '.join(other_images)}\n"
+            "如果某张裁切图与已有图片高度重叠（覆盖相同视觉元素），应 reject 该裁切。\n"
+        )
+
+    prompt = (
+        f"这是第{page_num + 1}页的原始图片（带编号框标注裁切区域），"
+        f"后面依次是 {len(crop_results)} 张裁切结果。\n\n"
+        f"裁切信息：\n" + "\n".join(crops_desc) + "\n"
+        f"{other_info}\n"
+        "<task>严格评估每张裁切图的质量。对照原始页面仔细检查。</task>\n\n"
+        "<critical_checks>\n"
+        "  <check>【完整性】对照原始页面：裁切框是否覆盖了该图形的完整区域？\n"
+        "    仔细检查框的上下左右是否有内容被截掉。\n"
+        "    例如：一个包含多个子图（如 Read + Write）的大图，框是否只框了其中一部分？\n"
+        "    如果截掉了内容 → adjust，提供覆盖完整图形的新 bbox。</check>\n"
+        "  <check>【页眉页脚】裁切是否包含了页眉(如\"XX用户手册\")、页脚、页码等无关内容？\n"
+        "    如果包含 → adjust，缩小 bbox 排除这些内容。</check>\n"
+        "  <check>【误检】该区域是否根本不是图片/图表？（纯文字段落、表格等）\n"
+        "    如果是误检 → reject。</check>\n"
+        "  <check>【多图合一】一个框内是否包含了多个完全独立、不相关的图形？\n"
+        "    如果是 → split。注意：同一个 Figure 的多个子图（如子图a、子图b）不需要拆分。</check>\n"
+        "</critical_checks>\n\n"
+        "<available_actions>\n"
+        "  accept — 裁切完整、无多余内容、无误检，保留原样\n"
+        "  reject — 误检或与已有图片重复，删除\n"
+        "  adjust — 边界需要扩大或缩小，提供新 bbox（归一化 [0,1000]）\n"
+        "  split  — 包含多个独立图形，拆分为多张，提供各子区域 bbox\n"
+        "</available_actions>\n\n"
+        "<output_format>\n"
+        "返回 JSON 数组，每个元素对应一张裁切图：\n"
+        '[\n'
+        '  {"index": 1, "action": "accept"},\n'
+        '  {"index": 2, "action": "reject", "reason": "与已有嵌入图重复"},\n'
+        '  {"index": 3, "action": "adjust", "bbox": [x1,y1,x2,y2], '
+        '"reason": "底部被截断，需要向下扩展"},\n'
+        '  {"index": 4, "action": "split", "regions": [\n'
+        '    {"bbox": [x1,y1,x2,y2], "desc": "上部图"},\n'
+        '    {"bbox": [x1,y1,x2,y2], "desc": "下部图"}\n'
+        '  ]}\n'
+        ']\n'
+        "坐标系: 归一化 [0,1000]，左上角(0,0)，右下角(1000,1000)。\n"
+        "只输出 JSON 数组，不要其他文字。\n"
+        "</output_format>"
+    )
+    content.append({"type": "text", "text": prompt})
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": content}],
+            temperature=0.1 + round_num * 0.1,
+            max_tokens=2048,
+            extra_body={"enable_thinking": False},
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+        actions = json.loads(raw)
+        if isinstance(actions, list):
+            return actions
+    except Exception as e:
+        print(f"  ⚠ AI裁切验证失败: {e}")
+
+    # 解析失败时全部 accept
+    return [{"index": i + 1, "action": "accept"} for i in range(len(crop_results))]
+
+
+def _execute_crop_actions(page_png_bytes, actions, crop_results, page_num, images_dir):
+    """根据 AI 验证结果执行裁切动作，返回更新后的 crop_results。"""
+    import numpy as np
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(page_png_bytes))
+
+    # index → action 映射
+    action_map = {}
+    for act in actions:
+        idx = act.get("index", 0) - 1
+        if 0 <= idx < len(crop_results):
+            action_map[idx] = act
+
+    new_results = []
+    for idx, (fname, desc, pixel_bbox) in enumerate(crop_results):
+        action = action_map.get(idx, {"action": "accept"})
+        act_type = action.get("action", "accept")
+
+        if act_type == "accept":
+            new_results.append((fname, desc, pixel_bbox))
+
+        elif act_type == "reject":
+            try:
+                os.remove(os.path.join(images_dir, fname))
+            except OSError:
+                pass
+
+        elif act_type == "adjust":
+            new_bbox = action.get("bbox")
+            if not isinstance(new_bbox, list) or len(new_bbox) != 4:
+                new_results.append((fname, desc, pixel_bbox))
+                continue
+            try:
+                x1, y1, x2, y2 = bbox_to_pixels(new_bbox, img.width, img.height)
+                # AI 给的坐标只做 padding，不再执行像素精修（避免精修反而破坏 AI 的判断）
+                padding = 5
+                x1 = max(0, x1 - padding)
+                y1 = max(0, y1 - padding)
+                x2 = min(img.width, x2 + padding)
+                y2 = min(img.height, y2 + padding)
+                if x2 - x1 < 80 or y2 - y1 < 80:
+                    new_results.append((fname, desc, pixel_bbox))
+                    continue
+                cropped = img.crop((x1, y1, x2, y2))
+                arr = np.array(cropped.convert("L"))
+                if (arr > 240).mean() > 0.95:
+                    new_results.append((fname, desc, pixel_bbox))
+                    continue
+                cropped.save(os.path.join(images_dir, fname))
+                new_results.append((fname, desc, (x1, y1, x2, y2)))
+            except Exception:
+                new_results.append((fname, desc, pixel_bbox))
+
+        elif act_type == "split":
+            try:
+                os.remove(os.path.join(images_dir, fname))
+            except OSError:
+                pass
+            regions = action.get("regions", [])
+            if not regions:
+                # 无有效子区域，从原 bbox 恢复
+                try:
+                    cropped = img.crop(pixel_bbox)
+                    cropped.save(os.path.join(images_dir, fname))
+                    new_results.append((fname, desc, pixel_bbox))
+                except Exception:
+                    pass
+                continue
+            for sub_idx, region in enumerate(regions):
+                sub_bbox = region.get("bbox")
+                sub_desc = region.get("desc", "")
+                if not isinstance(sub_bbox, list) or len(sub_bbox) != 4:
+                    continue
+                try:
+                    x1, y1, x2, y2 = bbox_to_pixels(sub_bbox, img.width, img.height)
+                    padding = 5
+                    x1 = max(0, x1 - padding)
+                    y1 = max(0, y1 - padding)
+                    x2 = min(img.width, x2 + padding)
+                    y2 = min(img.height, y2 + padding)
+                    if x2 - x1 < 80 or y2 - y1 < 80:
+                        continue
+                    cropped = img.crop((x1, y1, x2, y2))
+                    arr = np.array(cropped.convert("L"))
+                    if (arr > 240).mean() > 0.95:
+                        continue
+                    sub_fname = f"page{page_num + 1}_fig{idx + 1}_{chr(97 + sub_idx)}.png"
+                    cropped.save(os.path.join(images_dir, sub_fname))
+                    new_results.append((sub_fname, sub_desc, (x1, y1, x2, y2)))
+                except Exception:
+                    continue
+
+        else:
+            new_results.append((fname, desc, pixel_bbox))
+
+    return new_results
+
+
+def _ai_verify_and_refine_crops(client, model, page_png_bytes, crop_results,
+                                page_num, images_dir, *,
+                                max_rounds=_MAX_CROP_VERIFY_ROUNDS,
+                                other_images=None):
+    """AI 验证 + 优化裁切结果的主循环。
+
+    max_rounds: 最多验证轮数，防止死循环。
+    other_images: 同页已有的其他图片文件名（如嵌入图），传给 AI 做去重。
+    返回最终的 [(filename, desc, pixel_bbox)] 列表。
+    """
+    for round_num in range(max_rounds):
+        if not crop_results:
+            break
+
+        actions = _ai_verify_crops(
+            client, model, page_png_bytes, crop_results,
+            page_num, images_dir, round_num=round_num,
+            other_images=other_images,
+        )
+
+        # 打印每张图的验证结果
+        for a in actions:
+            act = a.get("action", "accept")
+            if act != "accept":
+                reason = a.get("reason", "")
+                tag = f"{act}" + (f"({reason})" if reason else "")
+                print(f"[fig{a.get('index', '?')}:{tag}]", end=" ", flush=True)
+
+        # 全部 accept → 无需继续
+        if all(a.get("action", "accept") == "accept" for a in actions):
+            break
+
+        crop_results = _execute_crop_actions(
+            page_png_bytes, actions, crop_results, page_num, images_dir,
+        )
+
+        # 仅 reject（无 adjust/split）→ 无新裁切需验证
+        if not any(a.get("action") in ("adjust", "split") for a in actions):
+            break
+
+    return crop_results
+
+
 # ── 核心：调用 Qwen 多模态 ─────────────────────────────────────────
 
 SYSTEM_PROMPT_SCANNED = """\
@@ -766,9 +1152,9 @@ SYSTEM_PROMPT_SCANNED = """\
 
 <rule id="figures">
 如果页面上有插图、图表等非文字内容：
-- 如果我提供了 <images> 列表中的图片文件名，在图出现的位置用 ![描述](images/文件名) 引用对应的图片
+- 如果我提供了 <images> 列表中的图片文件名，严格按照每个 <img> 标签的 pos 属性（纵向位置百分比）将图片插入到对应位置的文本中间，用 ![描述](images/文件名) 引用
 - 如果没有提供图片文件名，用 `<!-- 图：[简要描述] -->` 标注其位置和内容
-- 表格：尽量转写为 Markdown 表格
+- 表格：尽量转写为 Markdown 表格。如果一张图片的内容仅仅是表格，且你已完整转写为 Markdown 表格，则省略该图片引用
 </rule>
 
 <rule id="heading_levels">
@@ -786,6 +1172,14 @@ SYSTEM_PROMPT_SCANNED = """\
 - 如果 tail 末尾刚好在一个汉字/单词中间断开，直接输出本页续接的文字即可。
 - 如果本页底部的句子也没有说完，就正常输出到页面可见内容的末尾即可，下一页会接续。
 - **标题不受跨页续接影响**：即使本页顶部有续接文字，续接完成后，如果页面上有章节标题，仍然必须使用正确的 ## 或 ### 标记。标题标记永远不能省略。
+</rule>
+
+<rule id="cross_page_table">
+表格经常跨页。如果 previous_page_tail 末尾包含 Markdown 表格行（以 | 开头和结尾的行），说明上一页有一个表格可能延续到本页。
+- 如果本页顶部确实是该表格的延续数据：直接继续输出表格数据行（保持相同的列数和 | 分隔格式）
+- **不要重复表头行和分隔行**（| --- | 行），只输出新的数据行
+- 如果上一页表格单元格内的文字被分页截断（previous_page_tail 最后一行是不完整的表格行），本页开头的续接文字应直接作为该单元格内容的延续，保持在同一个表格行内
+- 表格续写完成后，页面上的其他内容（注释、正文、标题等）正常输出
 </rule>
 </critical_rules>
 
@@ -816,7 +1210,11 @@ SYSTEM_PROMPT = """\
 
 <rule id="images">
 我会告诉你本页有哪些图片文件名。默认每张图片都必须用 ![](images/文件名) 引用。
-唯一的例外：如果一张图片的内容**仅仅是代码/脚本文字**，且你已经完整转写为代码块，则可以省略该图片引用。
+图片列表已按页面从上到下排序，每个 <img> 标签有 pos 属性表示纵向位置百分比——请严格按照 pos 位置将图片插入到对应位置的文本中间。
+可以省略图片引用的情况：
+- 如果一张图片的内容**仅仅是代码/脚本文字**，且你已经完整转写为代码块
+- 如果一张图片的内容**仅仅是表格**（无论本页还是上一页已转写），且该表格已被完整转写为 Markdown 表格
+以上两种情况下，省略图片引用，不要重复展示已转写的内容。
 界面截图、操作步骤截图、示意图、对话框截图、任何包含 GUI 元素的图片，一律保留引用，即使你描述了其内容。
 拿不准的时候，保留图片引用。
 </rule>
@@ -825,6 +1223,14 @@ SYSTEM_PROMPT = """\
 代码、脚本、配置文件、数据数组等技术内容必须用 ``` 围栏包裹。
 如果能识别语言，加上语言标识（如 ```python、```c 等）。
 如果当前页的数据是上一页的延续，也必须用新的 ``` 围栏包裹。
+</rule>
+
+<rule id="cross_page_table">
+表格经常跨页。如果 previous_page_tail 末尾包含 Markdown 表格行（以 | 开头和结尾的行），说明上一页有一个表格可能延续到本页。
+- 如果本页顶部确实是该表格的延续数据：直接继续输出表格数据行（保持相同的列数和 | 分隔格式）
+- **不要重复表头行和分隔行**（| --- | 行），只输出新的数据行
+- 如果上一页表格单元格内的文字被分页截断，本页开头的续接文字应直接作为该单元格内容的延续，保持在同一个表格行内
+- 表格续写完成后，页面上的其他内容（注释、正文、标题等）正常输出
 </rule>
 
 <rule id="heading_levels">
@@ -878,17 +1284,24 @@ def _build_outline(all_md_parts):
 
 def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenames,
                           page_num, total_pages, prev_md_tail="", outline="",
-                          pdf_type="digital", page_image_mime="image/png"):
+                          pdf_type="digital", page_image_mime="image/png",
+                          image_positions=None):
     """调用 Qwen 多模态模型转换单页"""
 
     is_scanned = (pdf_type == "scanned")
     system_prompt = SYSTEM_PROMPT_SCANNED if is_scanned else SYSTEM_PROMPT
 
-    # 图片清单
+    # 图片清单（带位置提示，按从上到下排序）
     if image_filenames:
-        img_list = '\n'.join(f'    <img>{f}</img>' for f in image_filenames)
+        if image_positions:
+            img_list = '\n'.join(
+                f'    <img pos="{image_positions.get(f, "")}">{f}</img>'
+                for f in image_filenames
+            )
+        else:
+            img_list = '\n'.join(f'    <img>{f}</img>' for f in image_filenames)
         img_section = (
-            f"<images count=\"{len(image_filenames)}\">\n"
+            f"<images count=\"{len(image_filenames)}\" note=\"已按页面从上到下排序\">\n"
             f"{img_list}\n"
             f"  </images>"
         )
@@ -911,6 +1324,40 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
     else:
         outline_section = ""
 
+    def _extract_leading_table_cells(raw_text, expected_cols):
+        if not raw_text or expected_cols < 2:
+            return None
+        top_lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        if not top_lines:
+            return None
+
+        start = 0
+        while start < len(top_lines) and (
+            '用户手册' in top_lines[start]
+            or re.search(r'^www\.', top_lines[start], re.IGNORECASE)
+        ):
+            start += 1
+        if start < len(top_lines) and re.fullmatch(r'\d+', top_lines[start]):
+            start += 1
+
+        candidates = top_lines[start:start + 12]
+        if expected_cols == 3:
+            for idx in range(0, len(candidates) - 2):
+                cells = candidates[idx:idx + 3]
+                if not re.fullmatch(r'\d+[A-Za-z]?', cells[0]):
+                    continue
+                if any(len(cell) > 60 for cell in cells):
+                    continue
+                next_line = candidates[idx + 3] if idx + 3 < len(candidates) else ''
+                if next_line and not (
+                    next_line.startswith(('注：', '注:')) or len(next_line) > 40
+                ):
+                    continue
+                return [re.sub(r'\s+', ' ', cell).strip() for cell in cells]
+        return None
+
+    table_continuation_section = ""
+
     if prev_md_tail:
         # 检测 tail 末尾是否在句子中间被截断
         stripped_tail = prev_md_tail.rstrip()
@@ -919,10 +1366,44 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
             r'[。？！…」』\u201d]$|[.?!:;]$|\*\*$|```$',
             stripped_tail,
         )
+        # 检测 tail 末尾是否在表格中（最后非空行以 | 开头且包含多个 |）
+        ends_with_table = False
+        prev_table_col_count = 0
+        for _tl in reversed(stripped_tail.split('\n')):
+            _tl_s = _tl.strip()
+            if not _tl_s:
+                continue
+            if _tl_s.startswith('|') and '|' in _tl_s[1:]:
+                ends_with_table = True
+                prev_table_col_count = _tl_s.count('|') - 1
+            break
+
+        truncation_hints = []
+        if ends_with_table:
+            truncation_hints.append(
+                "上一页末尾是一个 Markdown 表格。如果本页顶部是该表格的延续内容，"
+                "请直接继续输出表格数据行（保持相同的 | 分隔列格式），不要重复表头和分隔行"
+            )
+            leading_cells = _extract_leading_table_cells(page_text, prev_table_col_count)
+            if leading_cells:
+                candidate_row = f"| {' | '.join(leading_cells)} |"
+                truncation_hints.append(
+                    f"当前页顶部检测到一行续表候选：{candidate_row}。"
+                    "如果页面内容一致，必须完整输出这一整行表格，不能只保留后面的注释或正文"
+                )
+                table_continuation_section = (
+                    "<detected_table_continuation>\n"
+                    f"  <expected_row>{candidate_row}</expected_row>\n"
+                    "</detected_table_continuation>"
+                )
         if is_mid_sentence:
+            truncation_hints.append("上一页末尾的句子被分页截断了，本页输出需要以续接文字开头")
+
+        if truncation_hints:
+            hints_xml = '\n'.join(f"  <!-- 注意：{h} -->" for h in truncation_hints)
             tail_section = (
                 f"<previous_page_tail truncated=\"true\">\n{prev_md_tail}\n"
-                f"  <!-- 注意：上一页末尾的句子被分页截断了，本页输出需要以续接文字开头 -->\n"
+                f"{hints_xml}\n"
                 f"  </previous_page_tail>"
             )
         else:
@@ -934,7 +1415,7 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
     if is_scanned:
         img_instructions = ""
         if image_filenames:
-            img_instructions = f"    - 本页有 {len(image_filenames)} 张已裁切的图片；在图出现的位置用 ![描述](images/文件名) 引用\n"
+            img_instructions = f"    - 本页有 {len(image_filenames)} 张已裁切的图片（已按页面从上到下排序，pos 属性为纵向位置百分比）；请严格按照 pos 位置将每张图片插入到对应位置的文本中间，用 ![描述](images/文件名) 引用\n"
         instructions = (
             f"  <instructions>\n"
             f"    - 精确 OCR 页面上的所有正文文字\n"
@@ -955,7 +1436,7 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
         instructions = (
             f"  <instructions>\n"
             f"    - 延续大纲中的标题层级和编号，不要重复已有的标题\n"
-            f"    - 本页有 {len(image_filenames)} 张图片；仅代码截图已完整转写的可省略，其余必须引用\n"
+            f"    - 本页有 {len(image_filenames)} 张图片（已按页面从上到下排序，pos 属性为纵向位置百分比）；请严格按照 pos 位置将每张图片插入到对应位置的文本中间；仅代码截图已完整转写的可省略，其余必须引用\n"
             f"    - 代码/脚本/数据数组必须用 ``` 围栏包裹\n"
             f"    - 忽略页眉、页脚、页码，不要输出到 Markdown\n"
             f"    - 目录页的条目用列表（- 条目），不要用标题标记\n"
@@ -968,6 +1449,8 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
     if outline_section:
         sections.append(f"  {outline_section}")
     sections.append(f"  {tail_section}")
+    if table_continuation_section:
+        sections.append(f"  {table_continuation_section}")
     if img_section:
         sections.append(f"  {img_section}")
     if text_section:
@@ -1115,6 +1598,188 @@ def _dedup_page_boundary(prev_text, curr_text):
     return curr_text
 
 
+# ── 已转写表格的图片引用清理 ────────────────────────────────────────
+
+_IMG_REF_RE = re.compile(r'^!\[.*?\]\(images/.+?\)\s*$')
+_TABLE_ROW_RE = re.compile(r'^\s*\|.+\|\s*$')
+
+
+def _remove_redundant_table_images(text: str) -> str:
+    """后处理：移除内容仅为表格且已被完整转写的嵌入图片引用。
+
+    检测逻辑（两阶段）：
+    1. 向上扫描 20 行寻找 markdown 表格行，遇到标题行则停止。
+    2. 若第 1 阶段被标题阻断，执行扩展扫描：穿过标题继续向上扫描
+       15 行。若找到表格，再检查图片块后方 5 行内是否紧跟标题行：
+       - 有标题跟随 → 图片是新章节自身内容（保留）
+       - 无标题跟随 → 图片是上方表格的残留截图（移除）
+    """
+    lines = text.split('\n')
+    to_remove = set()
+    _HEADING_LINE_RE = re.compile(r'^#{1,6}\s+')
+
+    i = 0
+    while i < len(lines):
+        if not _IMG_REF_RE.match(lines[i]):
+            i += 1
+            continue
+
+        # 收集连续的图片引用块（可能夹杂空行）
+        img_block_start = i
+        img_block_end = i
+        j = i + 1
+        while j < len(lines):
+            if _IMG_REF_RE.match(lines[j]):
+                img_block_end = j
+                j += 1
+            elif lines[j].strip() == '':
+                j += 1
+            else:
+                break
+
+        # ── 第 1 阶段：20 行内扫描，遇到标题则停止 ──
+        table_found_above = False
+        heading_blocked = False
+        for k in range(img_block_start - 1, max(0, img_block_start - 21), -1):
+            stripped = lines[k].strip()
+            if not stripped:
+                continue
+            if _HEADING_LINE_RE.match(lines[k]):
+                heading_blocked = True
+                break
+            if _TABLE_ROW_RE.match(lines[k]):
+                table_found_above = True
+                break
+
+        # ── 第 2 阶段：标题阻断后的扩展扫描 ──
+        if not table_found_above and heading_blocked:
+            # 从标题处继续向上扫描 15 行
+            heading_pos = None
+            for k in range(img_block_start - 1, max(0, img_block_start - 21), -1):
+                if _HEADING_LINE_RE.match(lines[k]):
+                    heading_pos = k
+                    break
+            if heading_pos is not None:
+                ext_table_found = False
+                for k in range(heading_pos - 1, max(0, heading_pos - 16), -1):
+                    stripped = lines[k].strip()
+                    if not stripped:
+                        continue
+                    if _TABLE_ROW_RE.match(lines[k]):
+                        ext_table_found = True
+                        break
+                    if _HEADING_LINE_RE.match(lines[k]):
+                        break
+                if ext_table_found:
+                    # 检查图片块后方 5 行内是否紧跟标题行
+                    has_heading_after = False
+                    for m in range(img_block_end + 1,
+                                   min(len(lines), img_block_end + 6)):
+                        if _HEADING_LINE_RE.match(lines[m]):
+                            has_heading_after = True
+                            break
+                    if not has_heading_after:
+                        table_found_above = True
+
+        if table_found_above:
+            for idx in range(img_block_start, img_block_end + 1):
+                if _IMG_REF_RE.match(lines[idx]):
+                    to_remove.add(idx)
+
+        i = max(j, i + 1)
+
+    if not to_remove:
+        return text
+
+    result = [line for idx, line in enumerate(lines) if idx not in to_remove]
+
+    # 压缩连续 3+ 空行为 2 空行
+    cleaned = []
+    blank_count = 0
+    for line in result:
+        if line.strip() == '':
+            blank_count += 1
+            if blank_count <= 2:
+                cleaned.append(line)
+        else:
+            blank_count = 0
+            cleaned.append(line)
+
+    return '\n'.join(cleaned)
+
+
+# ── 同级编号标题归一化 ──────────────────────────────────────────────
+
+# 匹配可能的编号子标题行：  可选的 # 前缀 + 括号编号 + 标题文字
+_NUMBERED_HEADING_RE = re.compile(
+    r'^(#{1,6}\s+)?([（(]\d+[）)]\s*.+)$'
+)
+_HEADING_NUM_RE = re.compile(r'[（(](\d+)[）)]')
+
+
+def _normalize_sibling_headings(text: str) -> str:
+    """后处理：归一化同级编号标题的 Markdown 层级。
+
+    PDF 跨页转换时，同一组编号标题（如 (1)...(2)...(3)...）可能被
+    不同 LLM 调用赋予不一致的标题级别（有的带 ###，有的没有)。
+    本函数检测这类编号序列并统一为相同层级。
+    """
+    lines = text.split('\n')
+
+    # 第一遍：收集所有编号标题行的信息
+    numbered = []  # (line_idx, heading_level, number)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        m = _NUMBERED_HEADING_RE.match(stripped)
+        if not m:
+            continue
+        nm = _HEADING_NUM_RE.match(m.group(2))
+        if not nm:
+            continue
+        prefix = m.group(1)
+        level = len(prefix.rstrip()) if prefix else 0  # 0 = 无 # 前缀
+        num = int(nm.group(1))
+        numbered.append((i, level, num))
+
+    if len(numbered) < 2:
+        return text
+
+    # 第二遍：按连续递增编号分组（间距 ≤ 150 行视为同组）
+    groups: list[list[tuple]] = []
+    cur_group = [numbered[0]]
+    for j in range(1, len(numbered)):
+        prev = cur_group[-1]
+        item = numbered[j]
+        # 编号连续递增 且 行距合理
+        if item[2] == prev[2] + 1 and (item[0] - prev[0]) <= 150:
+            cur_group.append(item)
+        else:
+            if len(cur_group) >= 2:
+                groups.append(cur_group)
+            cur_group = [item]
+    if len(cur_group) >= 2:
+        groups.append(cur_group)
+
+    # 第三遍：归一化每组标题层级
+    for group in groups:
+        levels = [it[1] for it in group]
+        if len(set(levels)) <= 1:
+            continue  # 已一致，跳过
+        # 选目标层级：取出现次数最多的非零层级；全为 0 则跳过
+        non_zero = [l for l in levels if l > 0]
+        if not non_zero:
+            continue
+        target = max(set(non_zero), key=non_zero.count)
+        prefix = '#' * target + ' '
+        for (line_idx, level, _num) in group:
+            if level != target:
+                # 去掉已有的 # 前缀（如果有），加上目标前缀
+                content = re.sub(r'^#{1,6}\s+', '', lines[line_idx].strip())
+                lines[line_idx] = prefix + content
+
+    return '\n'.join(lines)
+
+
 # ── LLM 辅助拼接 ────────────────────────────────────────────────────
 
 _STITCH_SYSTEM = """\
@@ -1133,6 +1798,10 @@ _STITCH_SYSTEM = """\
    - **绝对不要改写、润色、总结或添加原文没有的文字**
    - 你只能做：删除 page_start 开头重复的内容
 4. **只输出修正后的 page_start**，不要输出 page_end 的内容。
+5. **表格续接**：如果 page_end 末尾是 Markdown 表格行（包含 | 分隔列），而 page_start 也包含该表格的续行：
+   - 表格续行是**新内容**（不是重复），必须完整保留
+   - 确保续行保持相同的 | 分隔格式
+   - 如果 page_end 最后一行是未完成的表格行（单元格内文字被分页截断），将 page_start 开头的续接文字合并到该表格行中
 
 直接输出，不要解释。"""
 
@@ -1171,6 +1840,14 @@ def _boundary_needs_stitch(prev_text, curr_text):
     ))
     if prev_structural_end and curr_structural:
         return False
+
+    # 情况5：prev 以表格行结尾 + curr 以同列数表格行开头 → 干净的表格续接
+    if (last_line.startswith('|') and '|' in last_line[1:]
+            and first_line.startswith('|') and '|' in first_line[1:]):
+        prev_cols = last_line.count('|') - 1
+        curr_cols = first_line.count('|') - 1
+        if prev_cols == curr_cols and prev_cols > 0:
+            return False  # 表格续接，交给 \n 拼接 + 后处理合并
 
     # 检查是否有重叠迹象（curr 开头的内容在 prev 末尾出现过）
     prev_tail_lines = [l.strip() for l in prev_stripped.split('\n')[-5:] if l.strip()]
@@ -1249,6 +1926,15 @@ def _stitch_boundary_with_llm(client, prev_tail, curr_head, stitch_model="qwen3.
             print(f"  [stitch rejected: unclosed HTML comment {open_comments}/{close_comments}, fallback]")
             return None
 
+        # 验证：表格行不能丢失（防止 stitch 模型吞掉跨页表格的续接行）
+        orig_table_rows = len([l for l in curr_head.split('\n')
+                               if l.strip().startswith('|') and '|' in l.strip()[1:]])
+        result_table_rows = len([l for l in result.split('\n')
+                                 if l.strip().startswith('|') and '|' in l.strip()[1:]])
+        if result_table_rows < orig_table_rows:
+            print(f"  [stitch rejected: lost table rows {result_table_rows}/{orig_table_rows}, fallback]")
+            return None
+
         return result
     except Exception as e:
         # LLM 拼接失败时回退到简单拼接
@@ -1285,7 +1971,14 @@ def _join_pages_smart(parts, client=None):
 
         # 快速判断：是否需要处理这个边界
         if not _boundary_needs_stitch(prev, curr):
-            result_parts.append("\n\n" + curr)
+            # 表格续接时用 \n 拼接（保持同一个表格块），其他用 \n\n
+            prev_last = prev.rstrip().split('\n')[-1].strip() if prev.rstrip() else ''
+            curr_first = curr.lstrip('\n').split('\n')[0].strip() if curr.lstrip('\n') else ''
+            if (prev_last.startswith('|') and '|' in prev_last[1:]
+                    and curr_first.startswith('|') and '|' in curr_first[1:]):
+                result_parts.append("\n" + curr)
+            else:
+                result_parts.append("\n\n" + curr)
             continue
 
         # 取边界区：prev 末尾 + curr 开头
@@ -1301,9 +1994,17 @@ def _join_pages_smart(parts, client=None):
             if stitched is not None:
                 # stitched 是修正后的 curr_head（去重 + 续接处理）
                 corrected_curr = stitched + curr_rest
-                # 判断拼接方式：如果 prev 以不完整句结尾且 stitched 不以换行/标题开头，紧密拼接
-                if _is_incomplete_sentence(prev) and not re.match(r'\s*\n|^\s*#', stitched):
-                    result_parts.append(corrected_curr)
+                # 判断拼接方式：如果 prev 以不完整句结尾，紧密拼接
+                if _is_incomplete_sentence(prev):
+                    # LLM 可能返回前导空行，strip 后再判断是否为标题开头
+                    clean_start = stitched.lstrip('\n')
+                    if clean_start and not re.match(r'^\s*#', clean_start):
+                        # 紧密拼接：确保 prev 尾部只有一个 \n，curr 无前导空行
+                        if result_parts:
+                            result_parts[-1] = result_parts[-1].rstrip('\n') + '\n'
+                        result_parts.append(clean_start + curr_rest)
+                    else:
+                        result_parts.append("\n\n" + corrected_curr)
                 else:
                     result_parts.append("\n\n" + corrected_curr)
                 continue
@@ -1314,7 +2015,10 @@ def _join_pages_smart(parts, client=None):
             continue
 
         if _is_incomplete_sentence(prev) and _is_continuation_start(curr):
-            result_parts.append(curr)
+            # 紧密拼接：确保 prev 尾部只有一个 \n，curr 无前导空行
+            if result_parts:
+                result_parts[-1] = result_parts[-1].rstrip('\n') + '\n'
+            result_parts.append(curr.lstrip('\n'))
         else:
             result_parts.append("\n\n" + curr)
 
@@ -1382,12 +2086,23 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
                 figures = []
             if figures:
                 fig_results = crop_and_save_figures(page_png, figures, page_num, str(images_dir))
+                # AI 验证裁切质量：可 accept/reject/adjust/split
+                if fig_results:
+                    fig_results = _ai_verify_and_refine_crops(
+                        client, model, page_png, fig_results,
+                        page_num, str(images_dir),
+                    )
                 image_filenames = [f[0] for f in fig_results]
                 # 构建图片文件名→描述的映射，传给 OCR 调用
                 fig_desc_map = {f[0]: f[1] for f in fig_results}
+                fig_bboxes = {f[0]: f[2] for f in fig_results}
                 print(f"[img:{len(image_filenames)}]", end=" ", flush=True)
             else:
                 image_filenames = []
+                fig_bboxes = {}
+            # 按纵向位置排序并计算位置百分比
+            image_filenames, image_positions = _compute_image_positions(
+                image_filenames, page_png, fig_bboxes=fig_bboxes, page=page)
         else:
             # 数字PDF：嵌入图片提取 + AI 视觉检测（混合策略，确保不丢失图片信息）
             embedded_filenames = extract_and_save_images(doc, page, page_num, str(images_dir))
@@ -1401,6 +2116,13 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
 
             if figures:
                 fig_results = crop_and_save_figures(page_png, figures, page_num, str(images_dir))
+                # AI 验证裁切质量：可 accept/reject/adjust/split
+                if fig_results:
+                    fig_results = _ai_verify_and_refine_crops(
+                        client, model, page_png, fig_results,
+                        page_num, str(images_dir),
+                        other_images=embedded_filenames,
+                    )
                 ai_filenames = [f[0] for f in fig_results]
                 ai_pixel_bboxes = [f[2] for f in fig_results]
                 # 合并：AI检测图 + 非重叠嵌入图（去除被AI覆盖的嵌入图）
@@ -1408,9 +2130,14 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
                     page, doc, ai_filenames, ai_pixel_bboxes, embedded_filenames,
                     page_png, str(images_dir),
                 )
+                fig_bboxes = {f[0]: f[2] for f in fig_results}
                 print(f"[AI:{len(ai_filenames)} embed:{len(embedded_filenames)}->{len(image_filenames) - len(ai_filenames)}]", end=" ", flush=True)
             else:
                 image_filenames = embedded_filenames
+                fig_bboxes = {}
+            # 按纵向位置排序并计算位置百分比
+            image_filenames, image_positions = _compute_image_positions(
+                image_filenames, page_png, fig_bboxes=fig_bboxes, page=page)
 
         # 4. 构建滚动上下文：大纲 + 上一页末尾
         prev_tail = ""
@@ -1429,6 +2156,7 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
                 prev_md_tail=prev_tail, outline=outline,
                 pdf_type=pdf_type,
                 page_image_mime=page_api_mime,
+                image_positions=image_positions,
             )
             elapsed = time.time() - start
             print(f"OK ({elapsed:.1f}s)")
@@ -1454,6 +2182,12 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
     # 5. 智能拼接所有页面：LLM 辅助去重 + 断句合并
     print(f"\n  拼接 {len(all_md_parts)} 页...", end="", flush=True)
     md_content = _join_pages_smart(all_md_parts, client=client)
+
+    # 5.5 归一化跨页编号标题层级（不同 LLM 调用可能给同级标题不同的 # 层级）
+    md_content = _normalize_sibling_headings(md_content)
+
+    # 5.6 移除内容仅为表格的嵌入图片引用（表格已转写为 markdown，图片冗余）
+    md_content = _remove_redundant_table_images(md_content)
 
     # 统一换行符（API 可能返回 \r\n）
     md_content = md_content.replace('\r\n', '\n').replace('\r', '\n')
@@ -1811,15 +2545,219 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
         result_lines.append('```')
     md_content = '\n'.join(result_lines)
 
+    # 通用后处理：修复被分页与硬换行拆坏的 Markdown 表格
+    def _merge_split_tables(text):
+        def _starts_table_like(line):
+            s = line.strip()
+            return s.startswith('|') and s.count('|') >= 2
+
+        def _is_separator(line):
+            return bool(re.match(r'^\s*\|[\s:\-|]+\|\s*$', line.strip()))
+
+        def _normalize_row(row):
+            row = row.strip()
+            if not _starts_table_like(row):
+                return row
+            if row.endswith('|'):
+                return row
+            last_pipe = row.rfind('|')
+            before = row[:last_pipe].rstrip()
+            after = row[last_pipe + 1:].strip()
+            if not after:
+                return before + ' |'
+            return before + '<br>' + after + ' |'
+
+        def _append_last_cell(row, extra):
+            row = _normalize_row(row).rstrip()
+            last_pipe = row.rfind('|')
+            before = row[:last_pipe].rstrip()
+            return before + '<br>' + extra + ' |'
+
+        def _is_block_boundary(line):
+            stripped = line.strip()
+            if not stripped:
+                return False
+            return (
+                stripped.startswith(('#', '![', '- ', '* ', '> ', '```', '**'))
+                or stripped.startswith(('注：', '注:', 'Note:', 'NOTE:'))
+            )
+
+        def _normalize_wrapped_table_rows(source):
+            lines = source.split('\n')
+            normalized = []
+            current_row = None
+            pending_break = False
+
+            def _flush_row():
+                nonlocal current_row, pending_break
+                if current_row is None:
+                    return
+                normalized.append(_normalize_row(current_row))
+                current_row = None
+                pending_break = False
+
+            for line in lines:
+                stripped = line.strip()
+                if current_row is None:
+                    if _starts_table_like(stripped):
+                        current_row = stripped
+                    else:
+                        normalized.append(line)
+                    continue
+
+                if _starts_table_like(stripped):
+                    _flush_row()
+                    current_row = stripped
+                    continue
+
+                if not stripped:
+                    if current_row.strip().endswith('|'):
+                        _flush_row()
+                        normalized.append('')
+                    else:
+                        pending_break = True
+                    continue
+
+                if _is_block_boundary(stripped):
+                    _flush_row()
+                    normalized.append(line)
+                    continue
+
+                if current_row.strip().endswith('|'):
+                    _flush_row()
+                    normalized.append(line)
+                    continue
+
+                joiner = '<br>' if pending_break else ' '
+                current_row += joiner + stripped
+                pending_break = False
+
+            _flush_row()
+            return '\n'.join(normalized)
+
+        def _header_row(block):
+            if len(block) >= 2 and _is_separator(block[1]):
+                return block[0].strip()
+            return None
+
+        def _table_cols(block):
+            for line in block:
+                if _starts_table_like(line) and not _is_separator(line):
+                    return line.count('|') - 1
+            return None
+
+        def _split_parts(lines):
+            parts = []
+            i = 0
+            while i < len(lines):
+                if _starts_table_like(lines[i]):
+                    block = []
+                    while i < len(lines) and _starts_table_like(lines[i]):
+                        block.append(lines[i].strip())
+                        i += 1
+                    parts.append(('table', block))
+                else:
+                    block = []
+                    while i < len(lines) and not _starts_table_like(lines[i]):
+                        block.append(lines[i])
+                        i += 1
+                    parts.append(('text', block))
+            return parts
+
+        def _merge_blocks(source):
+            parts = _split_parts(source.split('\n'))
+            changed = True
+            while changed:
+                changed = False
+                i = 0
+                while i + 2 < len(parts):
+                    if parts[i][0] == 'table' and parts[i + 1][0] == 'text' and parts[i + 2][0] == 'table':
+                        prev = parts[i][1]
+                        gap = parts[i + 1][1]
+                        nxt = parts[i + 2][1]
+                        gap_nonempty = [line.strip() for line in gap if line.strip()]
+                        safe_gap = (
+                            len(gap_nonempty) <= 3 and
+                            all(not any(line.startswith(prefix) for prefix in ('#', '![', '- ', '* ', '> ', '```'))
+                                for line in gap_nonempty)
+                        )
+                        same_cols = _table_cols(prev) == _table_cols(nxt) and _table_cols(prev) is not None
+                        prev_header = _header_row(prev)
+                        next_header = _header_row(nxt)
+                        next_has_mid_separator = len(nxt) >= 2 and _is_separator(nxt[1])
+                        is_continuation = (
+                            not gap_nonempty or
+                            (safe_gap and (next_has_mid_separator or (prev_header and next_header == prev_header)))
+                        )
+                        if same_cols and is_continuation:
+                            merged = prev[:]
+                            if gap_nonempty:
+                                merged[-1] = _append_last_cell(merged[-1], '<br>'.join(gap_nonempty))
+                            skip = 0
+                            if prev_header and next_header == prev_header:
+                                skip = 2
+                            for idx, line in enumerate(nxt):
+                                if idx < skip:
+                                    continue
+                                if _is_separator(line):
+                                    continue
+                                merged.append(line)
+                            parts[i:i + 3] = [('table', merged)]
+                            changed = True
+                            break
+                    i += 1
+            return '\n'.join('\n'.join(block) for _, block in parts)
+
+        def _clean_table_blocks(source):
+            lines = source.split('\n')
+            cleaned = []
+            i = 0
+            while i < len(lines):
+                if _starts_table_like(lines[i]):
+                    block = []
+                    while i < len(lines) and _starts_table_like(lines[i]):
+                        block.append(lines[i].strip())
+                        i += 1
+                    first_header = block[0] if len(block) >= 2 and _is_separator(block[1]) else None
+                    output = []
+                    idx = 0
+                    if first_header:
+                        output.extend([block[0], block[1]])
+                        idx = 2
+                    while idx < len(block):
+                        row = block[idx]
+                        if _is_separator(row):
+                            idx += 1
+                            continue
+                        if idx + 1 < len(block) and _is_separator(block[idx + 1]):
+                            if first_header and row == first_header:
+                                idx += 2
+                                continue
+                            output.append(row)
+                            idx += 2
+                            continue
+                        output.append(row)
+                        idx += 1
+                    cleaned.extend(output)
+                else:
+                    cleaned.append(lines[i])
+                    i += 1
+            return '\n'.join(cleaned)
+
+        normalized = _normalize_wrapped_table_rows(text)
+        merged = _merge_blocks(normalized)
+        return _clean_table_blocks(merged)
+    md_content = _merge_split_tables(md_content)
+
     # 通用后处理：清理引用了不存在图片的 markdown 图片标记
-    def _remove_ghost_images(text, img_dir):
+    def _remove_ghost_images(text, base_dir):
         def _check_img(m):
-            img_path = img_dir / m.group(2)
+            img_path = base_dir / m.group(2)
             if img_path.exists():
                 return m.group(0)
             return ''  # 图片不存在，删除引用
         return re.sub(r'!\[([^\]]*)\]\((images/[^)]+)\)', _check_img, text)
-    md_content = _remove_ghost_images(md_content, images_dir)
+    md_content = _remove_ghost_images(md_content, output_dir)
     # 清理删除图片引用后可能产生的多余空行
     md_content = re.sub(r'\n{3,}', '\n\n', md_content)
 
