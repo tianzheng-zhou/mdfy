@@ -44,7 +44,7 @@ def get_client():
 
 
 AVAILABLE_MODELS = ["qwen3.5-flash", "qwen3.5-plus"]
-DEFAULT_MODEL = "qwen3.5-flash"
+DEFAULT_MODEL = "qwen3.5-plus"
 MODEL_IMAGE_MAX_BYTES = 7_500_000
 DETECTION_IMAGE_MAX_SIDE = 1600
 OCR_IMAGE_MAX_SIDE = 2200
@@ -777,6 +777,16 @@ SYSTEM_PROMPT_SCANNED = """\
 ### 用于节标题（章内的小节）。
 正文段落不加任何标题标记。
 </rule>
+
+<rule id="cross_page_continuity">
+书籍文字经常在页面底部断开——一个句子、甚至一个词可能被分页截断。
+- 查看 previous_page_tail：如果它的末尾是一个不完整的句子（没有以句号、问号、感叹号、冒号等结束），说明**上一页的末尾句子被分页截断了**。
+- 此时你必须在输出的**最开头**直接接续这个被截断的句子的剩余部分（从本页顶部看到的续文开始），不要另起段落，不要加空行。
+- **严禁重复**：绝对不要重复 previous_page_tail 中已经出现过的任何文字。tail 的内容已经被记录了，你只需要输出本页**新**的内容。
+- 如果 tail 末尾刚好在一个汉字/单词中间断开，直接输出本页续接的文字即可。
+- 如果本页底部的句子也没有说完，就正常输出到页面可见内容的末尾即可，下一页会接续。
+- **标题不受跨页续接影响**：即使本页顶部有续接文字，续接完成后，如果页面上有章节标题，仍然必须使用正确的 ## 或 ### 标记。标题标记永远不能省略。
+</rule>
 </critical_rules>
 
 <formatting>
@@ -902,7 +912,21 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
         outline_section = ""
 
     if prev_md_tail:
-        tail_section = f"<previous_page_tail>\n{prev_md_tail}\n  </previous_page_tail>"
+        # 检测 tail 末尾是否在句子中间被截断
+        stripped_tail = prev_md_tail.rstrip()
+        # 完整句子结束标志：中文句号、问号、感叹号、英文句点+空格/换行、冒号、引号闭合等
+        is_mid_sentence = bool(stripped_tail) and not re.search(
+            r'[。？！…」』\u201d]$|[.?!:;]$|\*\*$|```$',
+            stripped_tail,
+        )
+        if is_mid_sentence:
+            tail_section = (
+                f"<previous_page_tail truncated=\"true\">\n{prev_md_tail}\n"
+                f"  <!-- 注意：上一页末尾的句子被分页截断了，本页输出需要以续接文字开头 -->\n"
+                f"  </previous_page_tail>"
+            )
+        else:
+            tail_section = f"<previous_page_tail>\n{prev_md_tail}\n  </previous_page_tail>"
     else:
         tail_section = "<previous_page_tail>这是文档第一页</previous_page_tail>"
 
@@ -915,8 +939,13 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
             f"  <instructions>\n"
             f"    - 精确 OCR 页面上的所有正文文字\n"
             f"    - 延续大纲中的标题层级，不要重复已有的标题\n"
-            f"    - 【关键】查看 previous_page_tail，如果本页顶部的文字已经出现在 tail 中，跳过这些重复部分，从新内容开始\n"
-            f"    - 合并因分页断开的句子，还原为通顺的段落\n"
+            f"    - 【关键·跨页连续】查看 previous_page_tail 的末尾：\n"
+            f"      * 如果 tail 末尾不是完整句子（没有以。？！等结束），说明上一页句子被分页截断\n"
+            f"      * 此时你的输出必须以本页续接的文字开头，直接接上被截断的句子，不要另起段落\n"
+            f"      * ⚠️ 严禁重复：tail 中的文字已经被记录，你只输出本页新的内容。不要把 tail 最后一句再输出一遍。\n"
+            f"      * 如果 tail 末尾是完整句子，正常从本页新内容开始即可\n"
+            f"    - 续接完成后，如果页面上有章/节标题，仍必须使用 ## 或 ### 标记\n"
+            f"    - 如果本页底部的句子没有说完（被下一页截断），照常输出到可见内容末尾\n"
             f"    - 忽略页眉、页脚、页码\n"
             f"{img_instructions}"
             f"    - 直接输出 Markdown，不要解释\n"
@@ -972,6 +1001,327 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
     )
 
     return response.choices[0].message.content.strip()
+
+
+def _is_incomplete_sentence(text):
+    """判断文本末尾是否为未完成的句子（被分页截断）。
+
+    返回 True 表示末尾句子不完整，需要与下一页拼接。
+    """
+    stripped = text.rstrip()
+    if not stripped:
+        return False
+    # 以标题、图片引用、列表项、代码块结尾的视为完整
+    last_line = stripped.split('\n')[-1]
+    if re.match(r'^#{1,6} ', last_line):
+        return False
+    if re.match(r'^!\[', last_line):
+        return False
+    if re.match(r'^```', last_line):
+        return False
+    if re.match(r'^[-*] ', last_line):
+        return False
+    if re.match(r'^>', last_line):
+        return False
+    # 以中文/英文标点结束的句子视为完整
+    if re.search(r'[。？！…」』\u201d；：]$|[.?!;:]$|\*\*$', stripped):
+        return False
+    return True
+
+
+def _is_continuation_start(text):
+    """判断文本开头是否像是一个被截断句子的续接部分。
+
+    返回 True 表示开头不是一个独立新段落的起始。
+    结合 _is_incomplete_sentence 一起使用：只有前页末尾不完整时才调用此函数。
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return False
+    # 以标题、图片、列表、代码块、引用、HTML标签开头的不是续接
+    if re.match(r'^#{1,6} |^!\[|^```|^[-*] |^> |^<', stripped):
+        return False
+    first_char = stripped[0]
+    # 高置信续接：以中文功能词、助词、连接词开头（几乎不可能是句子/段落的开头）
+    if first_char in '和与及或但而且的了着过把被让给对向从到也都还又才就只已不没无' \
+       '，、；：）】」』"':
+        return True
+    # 以小写英文字母开头（英文句子不会以小写开头）
+    if first_char.islower():
+        return True
+    # 以英文闭合标点续接
+    if first_char in ',.;:)]\'"':
+        return True
+    # 中文汉字开头：检查前几个字是否有句末标点
+    # 如果续接文字在前3个字符内就出现了句末标点（。？！），说明是短续接尾巴
+    if '\u4e00' <= first_char <= '\u9fff':
+        head = stripped[:5]
+        # 如果前5字内有句末标点，很可能是上一句的尾巴
+        if re.search(r'[。？！]', head):
+            return True
+        # 如果前5字内有中文逗号/顿号，说明可能在句子中间
+        if re.search(r'[，、]', head):
+            return True
+    return False
+
+
+def _dedup_page_boundary(prev_text, curr_text):
+    """去除下一页开头与上一页末尾的重叠内容。
+
+    模型有时会重复 prev_tail 中的部分文字。此函数检测并移除
+    curr_text 开头与 prev_text 末尾重叠的行。
+
+    返回去重后的 curr_text。
+    """
+    if not prev_text or not curr_text:
+        return curr_text
+
+    # 取 prev 最后若干行和 curr 最前若干行进行比较
+    prev_lines = prev_text.rstrip().split('\n')
+    curr_lines = curr_text.lstrip('\n').split('\n')
+
+    # 只检查末尾/开头一定行数范围（避免误匹配远距离内容）
+    max_check = min(8, len(prev_lines), len(curr_lines))
+    if max_check == 0:
+        return curr_text
+
+    # 策略1：逐行精确匹配（curr 开头的连续行 == prev 末尾的连续行）
+    overlap_lines = 0
+    for n in range(1, max_check + 1):
+        prev_tail_lines = [l.strip() for l in prev_lines[-n:]]
+        curr_head_lines = [l.strip() for l in curr_lines[:n]]
+        if prev_tail_lines == curr_head_lines and all(l for l in prev_tail_lines):
+            overlap_lines = n
+
+    if overlap_lines > 0:
+        trimmed = '\n'.join(curr_lines[overlap_lines:])
+        return trimmed.lstrip('\n')
+
+    # 策略2：单行级别的重复检测（curr 第一个非空行 == prev 末尾某行）
+    first_curr_line = ''
+    first_curr_idx = 0
+    for idx, line in enumerate(curr_lines):
+        if line.strip():
+            first_curr_line = line.strip()
+            first_curr_idx = idx
+            break
+
+    if first_curr_line and len(first_curr_line) > 15:
+        for pl in prev_lines[-max_check:]:
+            if pl.strip() == first_curr_line:
+                trimmed = '\n'.join(curr_lines[first_curr_idx + 1:])
+                return trimmed.lstrip('\n')
+
+    return curr_text
+
+
+# ── LLM 辅助拼接 ────────────────────────────────────────────────────
+
+_STITCH_SYSTEM = """\
+你是一个文本拼接助手。你的唯一任务是修正"下一页"的开头。
+
+输入：
+<page_end> 上一页的末尾文字（已经确认正确，你不需要改动它）
+<page_start> 下一页的开头文字（可能有问题需要修正）
+
+你需要输出**修正后的 page_start 文字**，规则如下：
+1. **去重**：如果 page_start 的开头重复了 page_end 末尾已有的句子或段落，删除重复的部分。
+2. **续接断句**：如果 page_end 的最后一句话没有说完（被分页截断），page_start 的开头应该直接续接那个断句。确保 page_start 的输出开头就是续接文字，不要加空行。
+3. **严格保留原文**：
+   - 保留 page_start 中所有 Markdown 格式（## ### 标题、![alt](url) 图片引用、- 列表、> 引用）不变
+   - 保留所有 HTML 注释 <!-- ... --> 完整不变
+   - **绝对不要改写、润色、总结或添加原文没有的文字**
+   - 你只能做：删除 page_start 开头重复的内容
+4. **只输出修正后的 page_start**，不要输出 page_end 的内容。
+
+直接输出，不要解释。"""
+
+
+def _boundary_needs_stitch(prev_text, curr_text):
+    """快速判断两页边界是否需要 LLM 拼接。
+
+    返回 False 的情况（边界干净，不需要 LLM）：
+    - prev 以标题/代码块/图片/分隔符结尾，且 curr 以标题/图片等结构化元素开头
+    - prev 以句末标点结尾，且 curr 以标题/新段落开头（无重叠迹象）
+    """
+    prev_stripped = prev_text.rstrip()
+    curr_stripped = curr_text.lstrip('\n')
+    if not prev_stripped or not curr_stripped:
+        return False
+
+    last_line = prev_stripped.split('\n')[-1].strip()
+    first_line = curr_stripped.split('\n')[0].strip()
+
+    # prev 以完整句末结尾
+    prev_complete = bool(re.search(
+        r'[。？！…」』\u201d；]$|[.?!;:]$|\*\*$|```$', prev_stripped
+    ))
+    # curr 以结构化元素开头（标题、图片、代码块、列表）
+    curr_structural = bool(re.match(
+        r'^#{1,6} |^!\[|^```|^[-*] |^> |^---', first_line
+    ))
+
+    # 情况1：prev 完整结尾 + curr 结构化开头 → 干净边界
+    if prev_complete and curr_structural:
+        return False
+
+    # 情况2：prev 以标题/代码块/分隔线结尾 + curr 结构化开头
+    prev_structural_end = bool(re.match(
+        r'^#{1,6} |^```|^---', last_line
+    ))
+    if prev_structural_end and curr_structural:
+        return False
+
+    # 检查是否有重叠迹象（curr 开头的内容在 prev 末尾出现过）
+    prev_tail_lines = [l.strip() for l in prev_stripped.split('\n')[-5:] if l.strip()]
+    curr_head_lines = [l.strip() for l in curr_stripped.split('\n')[:3] if l.strip()]
+    has_overlap = any(cl in prev_tail_lines for cl in curr_head_lines if len(cl) > 10)
+
+    # 情况3：prev 不完整（未以句末标点结尾）→ 需要拼接
+    if not prev_complete:
+        return True
+
+    # 情况4：有重叠迹象 → 需要拼接
+    if has_overlap:
+        return True
+
+    return False
+
+
+def _stitch_boundary_with_llm(client, prev_tail, curr_head, stitch_model="qwen3.5-flash"):
+    """调用轻量 LLM 修正下一页开头（去重 + 续接断句）。
+
+    参数：
+        client: OpenAI 客户端
+        prev_tail: 上一页末尾 ~600 字
+        curr_head: 下一页开头 ~600 字
+        stitch_model: 用于拼接的模型（默认 flash，便宜快速）
+
+    返回修正后的 curr_head（去掉了重复、处理了续接），或 None 表示失败。
+    """
+    user_msg = (
+        f"<page_end>\n{prev_tail}\n</page_end>\n\n"
+        f"<page_start>\n{curr_head}\n</page_start>"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=stitch_model,
+            messages=[
+                {"role": "system", "content": _STITCH_SYSTEM},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.0,
+            max_tokens=4096,
+            extra_body={"enable_thinking": False},
+        )
+        result = response.choices[0].message.content.strip()
+
+        # 清理 LLM 可能输出的 markdown 围栏
+        result = re.sub(r'^```markdown\s*\n', '', result)
+        result = re.sub(r'\n```\s*$', '', result)
+
+        # 验证：结果不能比 curr_head 长太多（防止 LLM 把 page_end 也输出了，或生成新内容）
+        if len(result) > len(curr_head) * 1.1 + len(prev_tail) * 0.3:
+            print(f"  [stitch rejected: too long {len(result)} vs curr={len(curr_head)}, fallback]")
+            return None
+        # 验证：结果不能为空
+        if not result.strip():
+            return None
+
+        # 验证：结果中的标题和图片不能比 curr_head 少
+        orig_headings = len(re.findall(r'^#{1,6} ', curr_head, re.MULTILINE))
+        result_headings = len(re.findall(r'^#{1,6} ', result, re.MULTILINE))
+        if result_headings < orig_headings:
+            print(f"  [stitch rejected: lost headings {result_headings}/{orig_headings}, fallback]")
+            return None
+
+        orig_imgs = len(re.findall(r'!\[', curr_head))
+        result_imgs = len(re.findall(r'!\[', result))
+        if result_imgs < orig_imgs:
+            print(f"  [stitch rejected: lost images {result_imgs}/{orig_imgs}, fallback]")
+            return None
+
+        # 验证：HTML 注释完整性（有 <!-- 必须有配对的 -->）
+        open_comments = len(re.findall(r'<!--', result))
+        close_comments = len(re.findall(r'-->', result))
+        if open_comments != close_comments:
+            print(f"  [stitch rejected: unclosed HTML comment {open_comments}/{close_comments}, fallback]")
+            return None
+
+        return result
+    except Exception as e:
+        # LLM 拼接失败时回退到简单拼接
+        print(f"  [stitch LLM failed: {e}, fallback to regex]")
+        return None
+
+
+def _join_pages_smart(parts, client=None):
+    """智能拼接多页 Markdown 输出。
+
+    策略分三层：
+    1. 快速判断：边界干净（结构化分界）→ 直接 \\n\\n 拼接
+    2. LLM 拼接：边界可能有问题（断句/重复）→ 调用 flash 模型合并
+    3. 正则回退：LLM 不可用时用 _dedup_page_boundary + _is_continuation_start
+
+    参数：
+        parts: 每页的 Markdown 文本列表
+        client: OpenAI 客户端（传入则启用 LLM 拼接，None 则纯正则）
+    """
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+
+    result_parts = [parts[0]]
+    stitch_count = 0
+
+    for i in range(1, len(parts)):
+        prev = parts[i - 1]
+        curr = parts[i]
+
+        if not curr.strip():
+            continue
+
+        # 快速判断：是否需要处理这个边界
+        if not _boundary_needs_stitch(prev, curr):
+            result_parts.append("\n\n" + curr)
+            continue
+
+        # 取边界区：prev 末尾 + curr 开头
+        boundary_chars = 600
+        prev_tail = prev[-boundary_chars:] if len(prev) > boundary_chars else prev
+        curr_head = curr[:boundary_chars] if len(curr) > boundary_chars else curr
+        curr_rest = curr[boundary_chars:] if len(curr) > boundary_chars else ""
+
+        # 尝试 LLM 拼接（返回修正后的 curr_head，prev 不变）
+        if client is not None:
+            stitch_count += 1
+            stitched = _stitch_boundary_with_llm(client, prev_tail, curr_head)
+            if stitched is not None:
+                # stitched 是修正后的 curr_head（去重 + 续接处理）
+                corrected_curr = stitched + curr_rest
+                # 判断拼接方式：如果 prev 以不完整句结尾且 stitched 不以换行/标题开头，紧密拼接
+                if _is_incomplete_sentence(prev) and not re.match(r'\s*\n|^\s*#', stitched):
+                    result_parts.append(corrected_curr)
+                else:
+                    result_parts.append("\n\n" + corrected_curr)
+                continue
+
+        # 回退：正则去重 + 续接
+        curr = _dedup_page_boundary(prev, curr)
+        if not curr.strip():
+            continue
+
+        if _is_incomplete_sentence(prev) and _is_continuation_start(curr):
+            result_parts.append(curr)
+        else:
+            result_parts.append("\n\n" + curr)
+
+    if stitch_count > 0:
+        print(f"\n  [LLM stitch: {stitch_count} boundaries processed]")
+
+    return "".join(result_parts)
 
 
 # ── 主流程 ──────────────────────────────────────────────────────────
@@ -1065,8 +1415,8 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
         # 4. 构建滚动上下文：大纲 + 上一页末尾
         prev_tail = ""
         if all_md_parts:
-            # 扫描件需要更长的尾部来帮助模型去重跨页文本
-            tail_len = 800 if pdf_type == "scanned" else 500
+            # 扫描件需要更长的尾部来帮助模型识别跨页截断
+            tail_len = 1200 if pdf_type == "scanned" else 500
             prev_tail = all_md_parts[-1][-tail_len:]
         outline = _build_outline(all_md_parts)
 
@@ -1101,8 +1451,9 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
             if fname not in md_part:
                 all_md_parts[pg] += f"\n\n![](images/{fname})"
 
-    # 5. 拼接所有页面
-    md_content = "\n\n".join(all_md_parts)
+    # 5. 智能拼接所有页面：LLM 辅助去重 + 断句合并
+    print(f"\n  拼接 {len(all_md_parts)} 页...", end="", flush=True)
+    md_content = _join_pages_smart(all_md_parts, client=client)
 
     # 统一换行符（API 可能返回 \r\n）
     md_content = md_content.replace('\r\n', '\n').replace('\r', '\n')
@@ -1113,12 +1464,34 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
     # 也清理中间页面可能出现的围栏
     md_content = re.sub(r'\n```\s*\n\n```markdown\s*\n', '\n\n', md_content)
 
-    # 修复模型生成的坏图片引用格式，如 ![](images/page9[](images/page9_img1.png)
+    # 修复模型生成的坏图片引用格式
+    # 模式1: ![](images/page9[](images/page9_img1.png)  — page后有数字
+    # 模式2: ![](images/page[](images/page10_fig1.png)  — page后无数字
     md_content = re.sub(
-        r'!\[\]\(images/page\d+\[]\(images/(page\d+_(?:img|fig)\d+\.png)\)',
+        r'!\[\]\(images/page\d*\[]\(images/(page\d+_(?:img|fig)\d+\.png)\)',
         r'![](images/\1)',
         md_content,
     )
+
+    # 通用后处理：修复未闭合的 HTML 注释（OCR 产出的注释可能缺少 -->）
+    def _fix_unclosed_comments(text):
+        lines = text.split('\n')
+        in_comment = False
+        for i, line in enumerate(lines):
+            if '<!--' in line and '-->' not in line:
+                in_comment = True
+                # 找到注释起始行，查看后续行是否有 -->
+                # 如果下一个非空行不含 -->，就在当前行末尾补上
+                found_close = False
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    if '-->' in lines[j]:
+                        found_close = True
+                        break
+                if not found_close:
+                    lines[i] = line + ' -->'
+                    in_comment = False
+        return '\n'.join(lines)
+    md_content = _fix_unclosed_comments(md_content)
 
     # 通用后处理：修复缺少 images/ 前缀的图片引用
     md_content = re.sub(
@@ -1143,6 +1516,17 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
         after = md_content[first_h1.end():]
         after = re.sub(r'^# ', '## ', after, flags=re.MULTILINE)
         md_content = before + after
+
+    # 通用后处理：拆分同一行内合并的多个目录条目
+    # 例如 "        - 4.3.1 启用双缓冲操作- 4.3.2 控制访问哪个缓冲区" → 两行（保留缩进）
+    md_content = re.sub(
+        r'([ \t]*)(- \d[\d.]+ [^\n]+?)- (\d[\d.]+ )',
+        r'\1\2\n\1- \3',
+        md_content,
+    )
+
+    # 通用后处理：去重 OCR 产生的重复节号（如 "2.3.1 2.3.1 状态图" → "2.3.1 状态图"）
+    md_content = re.sub(r'(\d[\d.]+) \1 ', r'\1 ', md_content)
 
     # ── 通用后处理：目录页标题条目转为列表（在去重之前执行） ──
     # 检测方式1：寻找 ## 目录 标题
@@ -1198,6 +1582,44 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
         if changed:
             md_content = '\n'.join(lines)
 
+    # 通用后处理：按节号深度修正 TOC 条目缩进
+    # OCR 模型在跨页后常丢失缩进上下文，用节号层深（点号数量）推断正确缩进
+    lines = md_content.split('\n')
+    i = 0
+    while i < len(lines):
+        if re.match(r'^[ \t]*- \d[\d.]* ', lines[i]):
+            start = i
+            entry_count = 0
+            dotted_count = 0
+            while i < len(lines):
+                if re.match(r'^[ \t]*- ', lines[i]):
+                    entry_count += 1
+                    if re.match(r'^[ \t]*- \d+\.\d', lines[i]):
+                        dotted_count += 1
+                    i += 1
+                elif not lines[i].strip():
+                    i += 1
+                else:
+                    break
+            # 至少 5 个条目且有层级结构（带点号的条目）才视为 TOC
+            if entry_count >= 5 and dotted_count >= 2:
+                for j in range(start, i):
+                    m = re.match(r'^[ \t]*- (\d[\d.]*) ', lines[j])
+                    if m:
+                        depth = m.group(1).count('.')
+                        lines[j] = '    ' * depth + lines[j].lstrip()
+        else:
+            i += 1
+    md_content = '\n'.join(lines)
+
+    # 通用后处理：修复 TOC 条目中重复的节号（如 "2.3.1 2.3.1 状态图" → "2.3.1 状态图"）
+    md_content = re.sub(
+        r'^([ \t]*- )(\d[\d.]*) \2 ',
+        r'\1\2 ',
+        md_content,
+        flags=re.MULTILINE,
+    )
+
     # 通用后处理：去重重复出现的相同章节标题
     lines = md_content.split('\n')
     deduped = []
@@ -1216,6 +1638,43 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
                 prev_heading = None
         deduped.append(line)
     md_content = '\n'.join(deduped)
+
+    # ── 通用后处理：合并跨页断裂的段落 ──
+    # 检测模式：正文行（不以句末标点结尾）\n\n续接文字 → 合并为同一段落
+    # 仅合并两个都是纯正文行（非标题/列表/图片/代码/引用）的情况
+    lines = md_content.split('\n')
+    merged_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # 检查当前行是否是不完整的正文行（非空、非标题/列表/图片/代码/引用）
+        stripped = line.strip()
+        is_plain_text = (
+            stripped
+            and not re.match(r'^#{1,6} |^!\[|^```|^[-*] |^> |^<|^\d+\. |^\|', line)
+            and not re.search(r'[。？！…」』\u201d；]$|[.?!;]$|\*\*$|```$', stripped)
+        )
+        if is_plain_text and i + 1 < len(lines) and lines[i + 1].strip() == '':
+            # 往下找第一个非空行
+            j = i + 1
+            while j < len(lines) and lines[j].strip() == '':
+                j += 1
+            if j < len(lines):
+                next_stripped = lines[j].strip()
+                # 下一非空行是续接文字（非标题/列表/图片/代码/引用开头）且满足续接条件
+                next_is_continuation = (
+                    next_stripped
+                    and not re.match(r'^#{1,6} |^!\[|^```|^[-*] |^> |^<|^\d+\. |^\|', lines[j])
+                    and _is_continuation_start(next_stripped)
+                )
+                if next_is_continuation:
+                    # 合并：保留当前行，跳过空行
+                    merged_lines.append(line)
+                    i = j  # 跳到续接行，下次循环会加入
+                    continue
+        merged_lines.append(line)
+        i += 1
+    md_content = '\n'.join(merged_lines)
 
     # ── 扫描件专用后处理 ──
     if pdf_type == "scanned":
@@ -1351,6 +1810,18 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
     if in_bare_data:
         result_lines.append('```')
     md_content = '\n'.join(result_lines)
+
+    # 通用后处理：清理引用了不存在图片的 markdown 图片标记
+    def _remove_ghost_images(text, img_dir):
+        def _check_img(m):
+            img_path = img_dir / m.group(2)
+            if img_path.exists():
+                return m.group(0)
+            return ''  # 图片不存在，删除引用
+        return re.sub(r'!\[([^\]]*)\]\((images/[^)]+)\)', _check_img, text)
+    md_content = _remove_ghost_images(md_content, images_dir)
+    # 清理删除图片引用后可能产生的多余空行
+    md_content = re.sub(r'\n{3,}', '\n\n', md_content)
 
     md_path = output_dir / f"{pdf_path.stem}.md"
     with open(md_path, "w", encoding="utf-8") as f:
