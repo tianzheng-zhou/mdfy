@@ -1503,7 +1503,10 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": [
+                {"type": "text", "text": system_prompt,
+                 "cache_control": {"type": "ephemeral"}}
+            ]},
             {"role": "user", "content": user_content},
         ],
         temperature=0.1,
