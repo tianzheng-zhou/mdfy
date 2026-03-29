@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDF → Markdown AI 转换器</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📄</text></svg>">
+<style>
+/* ── Reset & Base ─────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f172a; --bg2:#1e293b; --bg3:#334155;
+  --fg:#f1f5f9; --fg2:#94a3b8; --fg3:#64748b;
+  --accent:#6366f1; --accent2:#818cf8; --accent3:#4f46e5;
+  --green:#22c55e; --red:#ef4444; --amber:#f59e0b;
+  --radius:12px; --shadow:0 4px 24px rgba(0,0,0,.3);
+}
+html{font-size:15px}
+body{
+  font-family:'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif;
+  background:var(--bg); color:var(--fg);
+  min-height:100vh; line-height:1.6;
+}
+a{color:var(--accent2);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* ── Layout ───────────────────────────────────────────── */
+.container{max-width:1200px;margin:0 auto;padding:24px 20px}
+header{text-align:center;padding:40px 0 24px}
+header h1{
+  font-size:2rem;font-weight:700;
+  background:linear-gradient(135deg,var(--accent2),#a78bfa,#f472b6);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+}
+header p{color:var(--fg2);margin-top:6px;font-size:.95rem}
+
+/* ── Card ─────────────────────────────────────────────── */
+.card{
+  background:var(--bg2);border-radius:var(--radius);
+  padding:28px;margin-bottom:24px;box-shadow:var(--shadow);
+  border:1px solid rgba(255,255,255,.06);
+}
+.card h2{font-size:1.15rem;margin-bottom:16px;color:var(--fg)}
+
+/* ── Upload Zone ──────────────────────────────────────── */
+.upload-zone{
+  border:2px dashed var(--bg3);border-radius:var(--radius);
+  padding:48px 24px;text-align:center;cursor:pointer;
+  transition:all .2s;position:relative;
+}
+.upload-zone:hover,.upload-zone.dragover{
+  border-color:var(--accent);background:rgba(99,102,241,.06);
+}
+.upload-zone svg{width:48px;height:48px;color:var(--fg3);margin-bottom:12px}
+.upload-zone p{color:var(--fg2);font-size:.9rem}
+.upload-zone .filename{
+  color:var(--accent2);font-weight:600;margin-top:10px;font-size:1rem;
+}
+#fileInput{display:none}
+
+/* ── Controls Row ─────────────────────────────────────── */
+.controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.controls select{
+  padding:10px 16px;border-radius:8px;border:1px solid var(--bg3);
+  background:var(--bg);color:var(--fg);font-size:.9rem;cursor:pointer;
+}
+.controls select:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.btn{
+  padding:10px 28px;border:none;border-radius:8px;cursor:pointer;
+  font-size:.95rem;font-weight:600;transition:all .15s;
+  display:inline-flex;align-items:center;gap:6px;
+}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent3)}
+.btn-primary:disabled{opacity:.45;cursor:not-allowed}
+.btn-secondary{background:var(--bg3);color:var(--fg)}
+.btn-secondary:hover{background:#475569}
+.btn-ghost{background:transparent;color:var(--accent2);padding:10px 16px}
+.btn-ghost:hover{background:rgba(99,102,241,.1)}
+
+/* ── Progress ─────────────────────────────────────────── */
+#progressSection{display:none}
+.progress-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.progress-bar-track{
+  height:6px;background:var(--bg);border-radius:3px;overflow:hidden;margin-bottom:16px;
+}
+.progress-bar-fill{
+  height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));
+  border-radius:3px;transition:width .4s;width:0%;
+}
+.log-box{
+  background:var(--bg);border-radius:8px;padding:14px 16px;
+  max-height:240px;overflow-y:auto;font-family:'Cascadia Code','Fira Code',monospace;
+  font-size:.82rem;line-height:1.7;color:var(--fg2);
+  border:1px solid rgba(255,255,255,.04);
+}
+.log-box .log-line{white-space:pre-wrap;word-break:break-all}
+.log-box .log-line:last-child{color:var(--fg)}
+
+.status-badge{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:4px 12px;border-radius:20px;font-size:.8rem;font-weight:600;
+}
+.status-converting{background:rgba(99,102,241,.15);color:var(--accent2)}
+.status-converting::before{
+  content:'';width:8px;height:8px;border-radius:50%;background:var(--accent2);
+  animation:pulse 1s infinite;
+}
+.status-done{background:rgba(34,197,94,.15);color:var(--green)}
+.status-error{background:rgba(239,68,68,.15);color:var(--red)}
+
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* ── Result Section ───────────────────────────────────── */
+#resultSection{display:none}
+.result-toolbar{
+  display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center;
+}
+.tab-group{display:flex;background:var(--bg);border-radius:8px;overflow:hidden}
+.tab-btn{
+  padding:8px 20px;border:none;cursor:pointer;
+  font-size:.85rem;font-weight:500;background:transparent;color:var(--fg3);
+  transition:all .15s;
+}
+.tab-btn.active{background:var(--accent);color:#fff}
+.tab-btn:hover:not(.active){color:var(--fg)}
+
+.result-pane{display:none;min-height:400px}
+.result-pane.active{display:block}
+
+/* Rendered Markdown */
+#renderedMd{
+  background:var(--bg);border-radius:8px;padding:24px 28px;
+  line-height:1.8;overflow-x:auto;border:1px solid rgba(255,255,255,.04);
+}
+#renderedMd h1{font-size:1.7rem;margin:24px 0 12px;border-bottom:1px solid var(--bg3);padding-bottom:8px}
+#renderedMd h2{font-size:1.4rem;margin:20px 0 10px;border-bottom:1px solid var(--bg3);padding-bottom:6px}
+#renderedMd h3{font-size:1.2rem;margin:16px 0 8px}
+#renderedMd h4{font-size:1.05rem;margin:14px 0 6px}
+#renderedMd p{margin:8px 0}
+#renderedMd img{max-width:100%;border-radius:8px;margin:12px 0}
+#renderedMd code{
+  background:var(--bg2);padding:2px 6px;border-radius:4px;font-size:.88em;
+  font-family:'Cascadia Code','Fira Code',monospace;
+}
+#renderedMd pre{
+  background:var(--bg2);padding:16px;border-radius:8px;overflow-x:auto;margin:12px 0;
+}
+#renderedMd pre code{background:transparent;padding:0}
+#renderedMd table{
+  border-collapse:collapse;width:100%;margin:12px 0;
+}
+#renderedMd th,#renderedMd td{
+  border:1px solid var(--bg3);padding:8px 12px;text-align:left;
+}
+#renderedMd th{background:var(--bg2);font-weight:600}
+#renderedMd blockquote{
+  border-left:3px solid var(--accent);padding:4px 16px;margin:12px 0;
+  color:var(--fg2);background:rgba(99,102,241,.04);border-radius:0 8px 8px 0;
+}
+#renderedMd ul,#renderedMd ol{padding-left:24px;margin:8px 0}
+#renderedMd li{margin:4px 0}
+#renderedMd hr{border:none;border-top:1px solid var(--bg3);margin:20px 0}
+
+/* Raw Source */
+#rawMd{
+  background:var(--bg);border-radius:8px;padding:16px;
+  font-family:'Cascadia Code','Fira Code',monospace;
+  font-size:.82rem;line-height:1.7;white-space:pre-wrap;word-break:break-all;
+  overflow-y:auto;max-height:700px;color:var(--fg2);
+  border:1px solid rgba(255,255,255,.04);
+}
+
+/* Images Gallery */
+.image-gallery{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
+  gap:12px;
+}
+.image-gallery .img-card{
+  background:var(--bg);border-radius:8px;overflow:hidden;
+  border:1px solid rgba(255,255,255,.04);transition:transform .15s;
+}
+.image-gallery .img-card:hover{transform:translateY(-2px)}
+.image-gallery .img-card img{width:100%;height:180px;object-fit:contain;background:#000;padding:8px}
+.image-gallery .img-card .img-name{
+  padding:8px 10px;font-size:.78rem;color:var(--fg3);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+
+/* Stats */
+.stat-row{
+  display:flex;gap:16px;flex-wrap:wrap;margin-top:16px;
+}
+.stat-item{
+  background:var(--bg);border-radius:8px;padding:12px 20px;
+  flex:1;min-width:120px;text-align:center;
+  border:1px solid rgba(255,255,255,.04);
+}
+.stat-item .stat-val{font-size:1.5rem;font-weight:700;color:var(--accent2)}
+.stat-item .stat-label{font-size:.78rem;color:var(--fg3);margin-top:2px}
+
+/* ── Responsive ───────────────────────────────────────── */
+@media(max-width:640px){
+  .container{padding:16px 12px}
+  header h1{font-size:1.5rem}
+  .card{padding:20px}
+  .upload-zone{padding:32px 16px}
+  .controls{flex-direction:column}
+  .controls .btn{width:100%}
+}
+
+/* ── Scrollbar ────────────────────────────────────────── */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--bg3);border-radius:3px}
+</style>
+</head>
+<body>
+
+<div class="container">
+
+<header>
+  <h1>📄 PDF → Markdown AI 转换器</h1>
+  <p>上传 PDF，使用 Qwen 多模态大模型智能转换为结构化 Markdown</p>
+</header>
+
+<!-- Upload Card -->
+<div class="card" id="uploadCard">
+  <div class="upload-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 16V4m0 0L8 8m4-4l4 4M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2"/></svg>
+    <p>拖拽 PDF 文件到此处，或 <strong>点击选择</strong></p>
+    <div class="filename" id="fileName"></div>
+  </div>
+  <input type="file" id="fileInput" accept=".pdf">
+
+  <div class="controls" style="margin-top:20px">
+    <select id="modelSelect">
+      {% for m in models %}
+      <option value="{{ m }}" {{ 'selected' if m == default_model else '' }}>{{ m }}</option>
+      {% endfor %}
+    </select>
+    <button class="btn btn-primary" id="convertBtn" disabled onclick="startConvert()">
+      🚀 开始转换
+    </button>
+  </div>
+</div>
+
+<!-- Progress Card -->
+<div class="card" id="progressSection">
+  <div class="progress-header">
+    <h2>转换进度</h2>
+    <span class="status-badge status-converting" id="statusBadge">转换中…</span>
+  </div>
+  <div class="progress-bar-track">
+    <div class="progress-bar-fill" id="progressBar"></div>
+  </div>
+  <div class="log-box" id="logBox"></div>
+</div>
+
+<!-- Result Card -->
+<div class="card" id="resultSection">
+  <div class="result-toolbar">
+    <div class="tab-group">
+      <button class="tab-btn active" data-tab="preview" onclick="switchTab(this)">📖 渲染预览</button>
+      <button class="tab-btn" data-tab="source" onclick="switchTab(this)">📝 源码</button>
+      <button class="tab-btn" data-tab="images" onclick="switchTab(this)">🖼️ 图片</button>
+    </div>
+    <div style="flex:1"></div>
+    <button class="btn btn-secondary" id="downloadZipBtn" onclick="downloadZip()">📦 下载 Zip</button>
+    <button class="btn btn-ghost" id="downloadMdBtn" onclick="downloadMd()">⬇ 下载 .md</button>
+  </div>
+
+  <!-- Stats -->
+  <div class="stat-row" id="statRow"></div>
+
+  <!-- Preview -->
+  <div class="result-pane active" id="pane-preview">
+    <div id="renderedMd"></div>
+  </div>
+
+  <!-- Source -->
+  <div class="result-pane" id="pane-source">
+    <div id="rawMd"></div>
+  </div>
+
+  <!-- Images -->
+  <div class="result-pane" id="pane-images">
+    <div class="image-gallery" id="imageGallery"></div>
+  </div>
+</div>
+
+</div>
+
+<!-- Markdown renderer: marked.js -->
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+<script>
+const dropZone    = document.getElementById('dropZone');
+const fileInput   = document.getElementById('fileInput');
+const fileName    = document.getElementById('fileName');
+const convertBtn  = document.getElementById('convertBtn');
+const modelSelect = document.getElementById('modelSelect');
+const logBox      = document.getElementById('logBox');
+const progressBar = document.getElementById('progressBar');
+const statusBadge = document.getElementById('statusBadge');
+const progressSection = document.getElementById('progressSection');
+const resultSection   = document.getElementById('resultSection');
+
+let selectedFile = null;
+let currentTaskId = null;
+
+/* ── Drag & Drop ──────────────────────────────────────── */
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.toLowerCase().endsWith('.pdf')) selectFile(f);
+});
+fileInput.addEventListener('change', () => { if (fileInput.files[0]) selectFile(fileInput.files[0]); });
+
+function selectFile(f) {
+  selectedFile = f;
+  fileName.textContent = `📎 ${f.name}  (${(f.size/1024/1024).toFixed(1)} MB)`;
+  convertBtn.disabled = false;
+}
+
+/* ── Convert ──────────────────────────────────────────── */
+async function startConvert() {
+  if (!selectedFile) return;
+
+  // Reset UI
+  convertBtn.disabled = true;
+  progressSection.style.display = 'block';
+  resultSection.style.display = 'none';
+  logBox.innerHTML = '';
+  progressBar.style.width = '0%';
+  statusBadge.className = 'status-badge status-converting';
+  statusBadge.textContent = '转换中…';
+
+  // Upload
+  const form = new FormData();
+  form.append('pdf', selectedFile);
+  form.append('model', modelSelect.value);
+
+  try {
+    const resp = await fetch('/upload', { method: 'POST', body: form });
+    const data = await resp.json();
+    if (data.error) { showError(data.error); return; }
+    currentTaskId = data.task_id;
+    listenProgress(data.task_id);
+  } catch(e) {
+    showError('上传失败: ' + e.message);
+  }
+}
+
+/* ── SSE Progress ─────────────────────────────────────── */
+function listenProgress(taskId) {
+  const es = new EventSource(`/progress/${taskId}`);
+  let pageRegex = /\[(\d+)\/(\d+)\]/;
+  let progressPercent = 2;
+
+  es.onmessage = (e) => {
+    appendLog(e.data);
+    // Try to parse page progress
+    let m = e.data.match(pageRegex);
+    if (m) {
+      let current = parseInt(m[1]), total = parseInt(m[2]);
+      progressPercent = Math.min(95, Math.round(current / total * 90) + 5);
+      progressBar.style.width = progressPercent + '%';
+    }
+    // Detect stitching phase
+    if (e.data.includes('拼接')) {
+      progressBar.style.width = '92%';
+    }
+  };
+
+  es.addEventListener('done', (e) => {
+    es.close();
+    progressBar.style.width = '100%';
+    statusBadge.className = 'status-badge status-done';
+    let info = JSON.parse(e.data);
+    statusBadge.textContent = `✓ 完成 (${info.elapsed.toFixed(1)}s)`;
+    convertBtn.disabled = false;
+    loadResult(taskId);
+  });
+
+  es.addEventListener('error', (e) => {
+    // SSE error event (not server error)
+    if (es.readyState === EventSource.CLOSED) return;
+    // Check if it's a server-sent error
+    if (e.data) {
+      es.close();
+      showError(e.data);
+    }
+  });
+}
+
+function appendLog(text) {
+  const div = document.createElement('div');
+  div.className = 'log-line';
+  div.textContent = text;
+  logBox.appendChild(div);
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+function showError(msg) {
+  statusBadge.className = 'status-badge status-error';
+  statusBadge.textContent = '❌ 错误';
+  appendLog('❌ ' + msg);
+  convertBtn.disabled = false;
+}
+
+/* ── Load Result ──────────────────────────────────────── */
+async function loadResult(taskId) {
+  const resp = await fetch(`/result/${taskId}`);
+  const data = await resp.json();
+  if (data.error) { showError(data.error); return; }
+
+  resultSection.style.display = 'block';
+
+  // Rendered preview — rewrite image paths
+  const mdWithImages = data.markdown.replace(
+    /!\[([^\]]*)\]\(images\/([^)]+)\)/g,
+    `![$1](/image/${taskId}/$2)`
+  );
+  document.getElementById('renderedMd').innerHTML = marked.parse(mdWithImages);
+
+  // Raw source
+  document.getElementById('rawMd').textContent = data.markdown;
+
+  // Images gallery
+  const gallery = document.getElementById('imageGallery');
+  gallery.innerHTML = '';
+  data.images.forEach(name => {
+    gallery.innerHTML += `
+      <div class="img-card">
+        <img src="/image/${taskId}/${name}" alt="${name}" loading="lazy">
+        <div class="img-name">${name}</div>
+      </div>`;
+  });
+
+  // Stats
+  const lines = data.markdown.split('\n').length;
+  const chars = data.markdown.length;
+  const headings = (data.markdown.match(/^#{1,6}\s/gm) || []).length;
+  const tables = (data.markdown.match(/^\|/gm) || []).length;
+  const imgCount = data.images.length;
+  document.getElementById('statRow').innerHTML = `
+    <div class="stat-item"><div class="stat-val">${lines}</div><div class="stat-label">行数</div></div>
+    <div class="stat-item"><div class="stat-val">${chars.toLocaleString()}</div><div class="stat-label">字符数</div></div>
+    <div class="stat-item"><div class="stat-val">${headings}</div><div class="stat-label">标题数</div></div>
+    <div class="stat-item"><div class="stat-val">${imgCount}</div><div class="stat-label">图片数</div></div>
+    <div class="stat-item"><div class="stat-val">${tables}</div><div class="stat-label">表格行</div></div>
+  `;
+
+  // Scroll to result
+  resultSection.scrollIntoView({ behavior: 'smooth' });
+}
+
+/* ── Tabs ─────────────────────────────────────────────── */
+function switchTab(btn) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.result-pane').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('pane-' + btn.dataset.tab).classList.add('active');
+}
+
+/* ── Downloads ────────────────────────────────────────── */
+function downloadZip() { if (currentTaskId) window.location = `/download/${currentTaskId}`; }
+function downloadMd()  { if (currentTaskId) window.location = `/download_md/${currentTaskId}`; }
+</script>
+
+</body>
+</html>
