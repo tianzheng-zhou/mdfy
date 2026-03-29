@@ -326,10 +326,27 @@ def _request_qwenvl_markdown(client, model, image_bytes, image_mime):
     return response.choices[0].message.content.strip()
 
 
+def _detect_image_rotation(transform):
+    """从 PDF 图片变换矩阵检测旋转角度，返回 0/±90/180。"""
+    import math
+    a, b = transform[0], transform[1]
+    angle = math.degrees(math.atan2(b, a))
+    rounded = round(angle / 90) * 90
+    return rounded if rounded % 360 != 0 else 0
+
+
 def extract_and_save_images(doc, page, page_num, images_dir):
     """提取并保存页面中的原始图片，返回图片文件名列表"""
     saved = []
     image_list = page.get_images(full=True)
+    # 获取图片变换矩阵，用于检测旋转
+    image_info = page.get_image_info(xrefs=True)
+    xref_transforms = {}
+    for info in image_info:
+        xr = info.get('xref', 0)
+        tf = info.get('transform')
+        if xr and tf:
+            xref_transforms[xr] = tf
     for img_index, img in enumerate(image_list):
         xref = img[0]
         try:
@@ -337,9 +354,20 @@ def extract_and_save_images(doc, page, page_num, images_dir):
             if pix.colorspace and pix.colorspace.n > 4:
                 pix = fitz.Pixmap(fitz.csRGB, pix)
             filename = f"page{page_num + 1}_img{img_index + 1}.png"
-            pix.save(os.path.join(images_dir, filename))
-            saved.append(filename)
+            filepath = os.path.join(images_dir, filename)
+            pix.save(filepath)
             pix = None
+            # 检测并修正 PDF 变换矩阵中的旋转
+            tf = xref_transforms.get(xref)
+            if tf:
+                rotation = _detect_image_rotation(tf)
+                if rotation != 0:
+                    from PIL import Image
+                    with Image.open(filepath) as im:
+                        # PDF 坐标系 y 轴向上，PIL y 轴向下，旋转方向取反
+                        corrected = im.rotate(-rotation, expand=True)
+                        corrected.save(filepath)
+            saved.append(filename)
         except Exception as e:
             print(f"  ⚠ 第{page_num+1}页图片{img_index+1}提取失败: {e}")
     return saved
@@ -1502,12 +1530,14 @@ def _is_incomplete_sentence(text):
         return False
     if re.match(r'^```', last_line):
         return False
-    if re.match(r'^[-*] ', last_line):
-        return False
     if re.match(r'^>', last_line):
         return False
+    list_match = re.match(r'^[ \t]*(?:[-*+]|\d+[.)])[ \t]+(.+)$', last_line)
+    sentence_tail = list_match.group(1).strip() if list_match else last_line.strip()
+    if not sentence_tail:
+        return False
     # 以中文/英文标点结束的句子视为完整
-    if re.search(r'[。？！…」』\u201d；：]$|[.?!;:]$|\*\*$', stripped):
+    if re.search(r'[。？！…」』\u201d；：]$|[.?!;:]$|\*\*$', sentence_tail):
         return False
     return True
 
@@ -1546,6 +1576,34 @@ def _is_continuation_start(text):
         if re.search(r'[，、]', head):
             return True
     return False
+
+
+def _merge_split_list_item_paragraphs(text: str) -> str:
+    """合并被空行错误拆开的列表项续句。"""
+    lines = text.split('\n')
+    merged = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if i + 2 < len(lines) and lines[i + 1] == '':
+            match = re.match(r'^([ \t]*(?:[-*+]|\d+[.)]))[ \t]+(.+)$', line)
+            next_line = lines[i + 2]
+            next_stripped = next_line.lstrip()
+            next_structural = bool(re.match(
+                r'^#{1,6} |^!\[|^```|^[-*+] |^\d+[.)] |^> |^\||^---',
+                next_stripped,
+            ))
+            if match and next_line.strip():
+                item_text = match.group(2).strip()
+                if (_is_incomplete_sentence(item_text)
+                        and not next_structural
+                        and _is_continuation_start(next_line)):
+                    merged.append(line)
+                    i += 2
+                    continue
+        merged.append(line)
+        i += 1
+    return '\n'.join(merged)
 
 
 def _dedup_page_boundary(prev_text, curr_text):
@@ -1609,14 +1667,16 @@ def _remove_redundant_table_images(text: str) -> str:
 
     检测逻辑（两阶段）：
     1. 向上扫描 20 行寻找 markdown 表格行，遇到标题行则停止。
-    2. 若第 1 阶段被标题阻断，执行扩展扫描：穿过标题继续向上扫描
-       15 行。若找到表格，再检查图片块后方 5 行内是否紧跟标题行：
-       - 有标题跟随 → 图片是新章节自身内容（保留）
-       - 无标题跟随 → 图片是上方表格的残留截图（移除）
+    2. 若第 1 阶段被标题阻断，执行扩展扫描：穿过标题继续向上扫描。
+       若找到表格，额外检查两个保护条件：
+       a. 图片周围是否有图表引用（"图 X" / "Figure X"）→ 保留
+       b. 图片后方是否紧跟同级或更深标题 → 保留
+          （更高级别标题 = 章节边界，不触发保护）
     """
     lines = text.split('\n')
     to_remove = set()
-    _HEADING_LINE_RE = re.compile(r'^#{1,6}\s+')
+    _HEADING_LINE_RE = re.compile(r'^(#{1,6})\s+')
+    _FIG_REF_RE = re.compile(r'[图Figure]\s*\d+|如图|见图|所示')
 
     i = 0
     while i < len(lines):
@@ -1640,6 +1700,7 @@ def _remove_redundant_table_images(text: str) -> str:
         # ── 第 1 阶段：20 行内扫描，遇到标题则停止 ──
         table_found_above = False
         heading_blocked = False
+        headings_crossed = 0
         for k in range(img_block_start - 1, max(0, img_block_start - 21), -1):
             stripped = lines[k].strip()
             if not stripped:
@@ -1651,34 +1712,52 @@ def _remove_redundant_table_images(text: str) -> str:
                 table_found_above = True
                 break
 
-        # ── 第 2 阶段：标题阻断后的扩展扫描 ──
+        # ── 第 2 阶段：标题阻断后的扩展扫描（穿透多层标题） ──
         if not table_found_above and heading_blocked:
-            # 从标题处继续向上扫描 15 行
-            heading_pos = None
-            for k in range(img_block_start - 1, max(0, img_block_start - 21), -1):
-                if _HEADING_LINE_RE.match(lines[k]):
-                    heading_pos = k
+            scan_start = img_block_start - 1
+            scan_limit = max(0, img_block_start - 60)
+            ext_table_found = False
+            headings_crossed = 0
+            crossed_levels = []
+            for k in range(scan_start, scan_limit, -1):
+                stripped = lines[k].strip()
+                if not stripped:
+                    continue
+                hm = _HEADING_LINE_RE.match(lines[k])
+                if hm:
+                    headings_crossed += 1
+                    crossed_levels.append(len(hm.group(1)))
+                    if headings_crossed > 3:
+                        break
+                    continue
+                if _TABLE_ROW_RE.match(lines[k]):
+                    ext_table_found = True
                     break
-            if heading_pos is not None:
-                ext_table_found = False
-                for k in range(heading_pos - 1, max(0, heading_pos - 16), -1):
-                    stripped = lines[k].strip()
-                    if not stripped:
-                        continue
-                    if _TABLE_ROW_RE.match(lines[k]):
-                        ext_table_found = True
+            if ext_table_found:
+                # 保护条件 A：图片周围有图表引用（"图 X"等）→ 保留
+                has_fig_ref = False
+                for m in range(max(0, img_block_start - 3),
+                               min(len(lines), img_block_end + 4)):
+                    if _FIG_REF_RE.search(lines[m]):
+                        has_fig_ref = True
                         break
-                    if _HEADING_LINE_RE.match(lines[k]):
-                        break
-                if ext_table_found:
-                    # 检查图片块后方 5 行内是否紧跟标题行
+                if not has_fig_ref:
+                    # 保护条件 B：后方标题层级 ≥ 穿越标题最小层级 → 保留
                     has_heading_after = False
+                    heading_after_level = 0
                     for m in range(img_block_end + 1,
                                    min(len(lines), img_block_end + 6)):
-                        if _HEADING_LINE_RE.match(lines[m]):
+                        h_after = _HEADING_LINE_RE.match(lines[m])
+                        if h_after:
                             has_heading_after = True
+                            heading_after_level = len(h_after.group(1))
                             break
-                    if not has_heading_after:
+                    if has_heading_after:
+                        min_crossed = min(crossed_levels) if crossed_levels else 99
+                        if heading_after_level < min_crossed:
+                            # 后续标题层级更高（章节边界），不保护
+                            table_found_above = True
+                    else:
                         table_found_above = True
 
         if table_found_above:
@@ -1706,6 +1785,36 @@ def _remove_redundant_table_images(text: str) -> str:
             cleaned.append(line)
 
     return '\n'.join(cleaned)
+
+
+# ── 编号标题层级规范化 ──────────────────────────────────────────────
+
+_DOTTED_HEADING_RE = re.compile(
+    r'^(#{1,6})\s+(\d+(?:\.\d+)+)\s+(.*)',
+)
+
+
+def _normalize_numbered_heading_levels(text: str) -> str:
+    """根据节号中的点号数量规范化标题层级。
+
+    LLM 逐页调用时常将所有编号标题输出为 ###，导致 3.5 和 3.5.1
+    处于同一层级。本函数根据编号深度自动调整：
+      X.Y → ###，X.Y.Z → ####，X.Y.Z.W → #####
+    """
+    lines = text.split('\n')
+    result = []
+    for line in lines:
+        m = _DOTTED_HEADING_RE.match(line)
+        if m:
+            section_num = m.group(2)
+            rest = m.group(3)
+            segments = section_num.count('.') + 1
+            target_level = min(segments + 1, 6)  # 1段=##, 2段=###, 3段=####, ...
+            new_hashes = '#' * target_level
+            result.append(f'{new_hashes} {section_num} {rest}')
+        else:
+            result.append(line)
+    return '\n'.join(result)
 
 
 # ── 同级编号标题归一化 ──────────────────────────────────────────────
@@ -2185,6 +2294,9 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
 
     # 5.5 归一化跨页编号标题层级（不同 LLM 调用可能给同级标题不同的 # 层级）
     md_content = _normalize_sibling_headings(md_content)
+
+    # 5.5b 根据编号深度规范化标题层级（X.Y → ###, X.Y.Z → ####, ...）
+    md_content = _normalize_numbered_heading_levels(md_content)
 
     # 5.6 移除内容仅为表格的嵌入图片引用（表格已转写为 markdown，图片冗余）
     md_content = _remove_redundant_table_images(md_content)
@@ -2748,6 +2860,36 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
         merged = _merge_blocks(normalized)
         return _clean_table_blocks(merged)
     md_content = _merge_split_tables(md_content)
+
+    # 合并被空行错误拆开的列表项续句
+    md_content = _merge_split_list_item_paragraphs(md_content)
+
+    # 清理跨页拼接产生的孤儿碎片（如 "度。" 重复自上段末尾 "长度。"）
+    def _remove_orphan_boundary_fragments(text):
+        lines = text.split('\n')
+        to_remove = set()
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            m = re.match(r'^([\u4e00-\u9fffa-zA-Z]{1,3})([。？！])(.*)', stripped)
+            if not m:
+                continue
+            frag = m.group(1)
+            rest = m.group(3)
+            if not rest.strip():
+                continue
+            # 向上找最近的非空行
+            prev_line = ''
+            for k in range(i - 1, max(0, i - 5), -1):
+                if lines[k].strip():
+                    prev_line = lines[k].strip()
+                    break
+            if prev_line and prev_line.endswith(frag + m.group(2)):
+                # 确认是孤儿碎片，移除开头的 "度。" 保留后续内容
+                lines[i] = line[:len(line) - len(line.lstrip())] + rest.lstrip()
+        return '\n'.join(lines)
+    md_content = _remove_orphan_boundary_fragments(md_content)
 
     # 通用后处理：清理引用了不存在图片的 markdown 图片标记
     def _remove_ghost_images(text, base_dir):
