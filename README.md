@@ -93,6 +93,72 @@ WEB_HOST=0.0.0.0  # 监听地址，默认 0.0.0.0
 WEB_PORT=23504     # 端口号，默认 23504
 ```
 
+## API 服务
+
+项目提供完整的 RESTful API（`/api/v1/`），方便其他应用集成调用。
+
+### 快速使用
+
+```python
+import requests, time
+
+BASE = "http://localhost:23504/api/v1"
+HEADERS = {"X-API-Key": "your-key"}  # 未设置 MDFY_API_KEY 可省略
+
+# 1. 上传 PDF 开始转换
+with open("doc.pdf", "rb") as f:
+    resp = requests.post(f"{BASE}/convert", headers=HEADERS,
+        files={"file": f}, data={"model": "qwen3.5-plus"})
+task_id = resp.json()["data"]["task_id"]
+
+# 2. 轮询等待
+while True:
+    status = requests.get(f"{BASE}/tasks/{task_id}", headers=HEADERS).json()["data"]
+    if status["status"] in ("done", "error"):
+        break
+    time.sleep(3)
+
+# 3. 获取结果
+result = requests.get(f"{BASE}/tasks/{task_id}/result", headers=HEADERS).json()["data"]
+print(result["markdown"])
+```
+
+### API 端点一览
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/health` | 健康检查（无需认证） |
+| GET | `/api/v1/models` | 列出可用模型 |
+| POST | `/api/v1/convert` | 上传 PDF 并启动转换 |
+| GET | `/api/v1/tasks/{id}` | 查询任务状态 |
+| GET | `/api/v1/tasks/{id}/progress` | SSE 实时进度流 |
+| GET | `/api/v1/tasks/{id}/result` | 获取完整结果（Markdown + 图片列表） |
+| GET | `/api/v1/tasks/{id}/result/markdown` | 仅获取 Markdown |
+| GET | `/api/v1/tasks/{id}/images` | 列出所有图片 |
+| GET | `/api/v1/tasks/{id}/images/{name}` | 获取指定图片 |
+| GET | `/api/v1/tasks/{id}/download` | 下载 ZIP 包 |
+| GET | `/api/v1/tasks/{id}/download/markdown` | 下载 Markdown 文件 |
+
+### 认证
+
+设置环境变量 `MDFY_API_KEY` 后，所有请求需携带 API Key：
+
+```bash
+# Header 方式
+curl -H "X-API-Key: your-key" http://localhost:23504/api/v1/models
+
+# Query 参数方式
+curl http://localhost:23504/api/v1/models?api_key=your-key
+```
+
+未设置 `MDFY_API_KEY` 则无需认证，适合本地 / 内网使用。
+
+### 完整文档
+
+启动服务后访问：
+- **交互式文档页面**：http://localhost:23504/api/docs
+- **JSON Schema**：http://localhost:23504/api/v1/docs
+
 ## 模型选择
 
 | 模型 | 特点 |

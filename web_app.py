@@ -21,6 +21,7 @@ from flask import (
 )
 
 from pdf_to_md_ai import pdf_to_markdown_ai, AVAILABLE_MODELS, DEFAULT_MODEL
+from api import api_bp, init_api
 
 # ── Flask 配置 ──────────────────────────────────────────────────────
 
@@ -72,6 +73,17 @@ class TaskInfo:
 
 
 # ── 路由 ────────────────────────────────────────────────────────────
+
+# ── 注册 API Blueprint ──────────────────────────────────────────────
+init_api(tasks, UPLOAD_DIR)
+app.register_blueprint(api_bp)
+
+
+@app.route("/api/docs")
+def api_docs_page():
+    """API 文档页面"""
+    return render_template("api_docs.html")
+
 
 @app.route("/")
 def index():

@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mdfy API 文档</title>
+<style>
+  :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --green: #3fb950; --orange: #d29922; --red: #f85149; --code-bg: #1c2128; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; }
+  .container { max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; }
+  h1 { font-size: 2rem; margin-bottom: .5rem; }
+  h1 span { color: var(--accent); }
+  .subtitle { color: var(--muted); margin-bottom: 2rem; font-size: 1.1rem; }
+  h2 { font-size: 1.4rem; margin: 2.5rem 0 1rem; padding-bottom: .5rem; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.1rem; margin: 1.5rem 0 .5rem; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: .75rem; font-weight: 700; text-transform: uppercase; margin-right: .5rem; vertical-align: middle; }
+  .badge-get { background: #1f6feb33; color: var(--accent); border: 1px solid #1f6feb55; }
+  .badge-post { background: #3fb95033; color: var(--green); border: 1px solid #3fb95055; }
+  .endpoint { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem; margin-bottom: 1rem; }
+  .endpoint-header { display: flex; align-items: center; gap: .5rem; margin-bottom: .5rem; }
+  .endpoint-path { font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: .95rem; }
+  .endpoint-desc { color: var(--muted); font-size: .9rem; margin-bottom: .8rem; }
+  table { width: 100%; border-collapse: collapse; margin: .8rem 0; font-size: .9rem; }
+  th, td { text-align: left; padding: .5rem .8rem; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; }
+  td code { background: var(--code-bg); padding: 1px 5px; border-radius: 3px; font-size: .85rem; }
+  .required { color: var(--red); font-size: .75rem; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: .85rem; line-height: 1.5; margin: .8rem 0; }
+  code { font-family: 'Cascadia Code', 'Fira Code', monospace; }
+  .note { background: #1f6feb15; border-left: 3px solid var(--accent); padding: .8rem 1rem; border-radius: 0 6px 6px 0; margin: 1rem 0; font-size: .9rem; }
+  .note strong { color: var(--accent); }
+  .status-table td:first-child { font-weight: 600; font-family: monospace; }
+  .tabs { display: flex; gap: 0; margin-bottom: 0; }
+  .tab { padding: .5rem 1rem; cursor: pointer; background: var(--card); border: 1px solid var(--border); border-bottom: none; border-radius: 6px 6px 0 0; color: var(--muted); font-size: .85rem; }
+  .tab.active { background: var(--code-bg); color: var(--text); border-bottom-color: var(--code-bg); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .tab-pre { margin-top: 0; border-top-left-radius: 0; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .flow { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin: 1rem 0; }
+  .flow-step { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: .5rem .8rem; font-size: .85rem; }
+  .flow-arrow { color: var(--muted); font-size: 1.2rem; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1><span>mdfy</span> API 文档</h1>
+<p class="subtitle">PDF → Markdown AI 转换服务 · RESTful API v1</p>
+
+<div class="note">
+  <strong>Base URL:</strong> <code id="baseUrl">http://localhost:23504/api/v1</code><br>
+  <strong>交互式文档（JSON）：</strong> <a href="/api/v1/docs">/api/v1/docs</a>
+</div>
+
+<h2>认证</h2>
+<p>如果服务端设置了 <code>MDFY_API_KEY</code> 环境变量，则所有 API 请求（除 <code>/health</code> 和 <code>/docs</code>）需要携带 API Key：</p>
+<table>
+  <tr><th>方式</th><th>示例</th></tr>
+  <tr><td>HTTP Header</td><td><code>X-API-Key: your-key-here</code></td></tr>
+  <tr><td>Query 参数</td><td><code>?api_key=your-key-here</code></td></tr>
+</table>
+<p style="color:var(--muted);margin-top:.5rem;font-size:.9rem">未设置 <code>MDFY_API_KEY</code> 时无需认证，适合本地 / 内网使用。</p>
+
+<h2>响应格式</h2>
+<pre><code>{
+  "success": true,          // bool: 请求是否成功
+  "data": { ... },          // object|null: 业务数据
+  "error": null             // string|null: 错误信息
+}</code></pre>
+
+<h2>典型工作流</h2>
+<div class="flow">
+  <div class="flow-step">① POST /convert<br><small>上传 PDF</small></div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">② GET /tasks/{id}<br><small>轮询状态</small></div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">③ GET /tasks/{id}/result<br><small>获取结果</small></div>
+</div>
+<p style="color:var(--muted);font-size:.9rem">也可使用 SSE 端点 <code>/tasks/{id}/progress</code> 替代步骤②，获得实时日志推送。</p>
+
+<h2>API 端点</h2>
+
+<!-- Health -->
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="badge badge-get">GET</span>
+    <code class="endpoint-path">/health</code>
+  </div>
+  <div class="endpoint-desc">健康检查（无需认证）</div>
+  <pre><code>// Response 200
+{
+  "success": true,
+  "data": { "status": "ok", "timestamp": 1743235200.0 }
+}</code></pre>
+</div>
+
+<!-- Models -->
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="badge badge-get">GET</span>
+    <code class="endpoint-path">/models</code>
+  </div>
+  <div class="endpoint-desc">列出可用的 AI 模型</div>
+  <pre><code>// Response 200
+{
+  "success": true,
+  "data": {
+    "models": ["qwen3.5-flash", "qwen3.5-plus"],
+    "default": "qwen3.5-plus"
+  }
+}</code></pre>
+</div>
+
+<!-- Convert -->
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="badge badge-post">POST</span>
+    <code class="endpoint-path">/convert</code>
+  </div>
+  <div class="endpoint-desc">上传 PDF 文件并启动异步转换任务</div>
+  <h3>请求参数（multipart/form-data）</h3>
+  <table>
+    <tr><th>参数</th><th>类型</th><th>必填</th><th>说明</th></tr>
+    <tr><td><code>file</code></td><td>File</td><td><span class="required">必填</span></td><td>PDF 文件</td></tr>
+    <tr><td><code>model</code></td><td>String</td><td>可选</td><td>AI 模型名，默认 <code>qwen3.5-plus</code></td></tr>
+  </table>
+  <pre><code>// Response 202
+{
+  "success": true,
+  "data": {
+    "task_id": "20260329_120000_abc123def456",
+    "pdf_name": "example.pdf",
+    "model": "qwen3.5-plus",
+    "status": "pending"
+  }
+}</code></pre>
+</div>
+
+<!-- Task Status -->
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="badge badge-get">GET</span>
+    <code class="endpoint-path">/tasks/{task_id}</code>
+  </div>
+  <div class="endpoint-desc">查询任务状态</div>
+  <h3>任务状态值</h3>
+  <table>
+    <tr><th>状态</th><th>含义</th></tr>
+    <tr><td><code>pending</code></td><td>已创建，等待处理</td></tr>
+    <tr><td><code>converting</code></td><td>正在转换中</td></tr>
+    <tr><td><code>done</code></td><td>转换完成</td></tr>
+    <tr><td><code>error</code></td><td>转换失败</td></tr>
+  </table>
+  <pre><code>// Response 200
+{
+  "success": true,
+  "data": {
+    "task_id": "20260329_120000_abc123def456",
+    "pdf_name": "example.pdf",
+    "model": "qwen3.5-plus",
+    "status": "converting",
+    "elapsed_seconds": 12.3,
+    "error": null
+  }
+}</code></pre>
+</div>
+
+<!-- SSE Progress -->
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="badge badge-get">GET</span>
+    <code class="endpoint-path">/tasks/{task_id}/progress</code>
+  </div>
+  <div class="endpoint-desc">SSE 实时进度推送（Server-Sent Events）</div>
+  <h3>事件类型</h3>
+  <table>
+    <tr><th>事件</th><th>说明</th></tr>
+    <tr><td><code>data</code></td><td>实时日志行（默认事件类型 message）</td></tr>
+    <tr><td><code>done</code></td><td>转换完成，payload: <code>{"elapsed": 秒数}</code></td></tr>
+    <tr><td><code>error</code></td><td>转换失败，payload: <code>{"error": "错误信息"}</code></td></tr>
+  </table>
+  <pre><code>// 使用 JavaScript EventSource
+const es = new EventSource("/api/v1/tasks/TASK_ID/progress");
+es.onmessage = (e) => console.log("日志:", e.data);
+es.addEventListener("done", (e) => {
+  console.log("完成:", JSON.parse(e.data));
+  es.close();
+});
+es.addEventListener("error", (e) => {
+  console.error("失败:", e.data);
+  es.close();
+});</code></pre>
+</div>
+
+<!-- Result -->
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="badge badge-get">GET</span>
+    <code class="endpoint-path">/tasks/{task_id}/result</code>
+  </div>
+  <div class="endpoint-desc">获取完整转换结果（Markdown 内容 + 图片列表）</div>
+  <pre><code>// Response 200
+{
+  "success": true,
+  "data": {
+    "task_id": "...",
+    "markdown": "# 文档标题\n\n正文内容...\n\n![图片](images/page0_img1.png)",
+    "images": ["page0_img1.png", "page1_img1.png"],
+    "image_count": 2
+  }
+}</code></pre>
+</div>
+
+<!-- Result Markdown Only -->
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="badge badge-get">GET</span>
+    <code class="endpoint-path">/tasks/{task_id}/result/markdown</code>
+  </div>
+  <div class="endpoint-desc">仅获取 Markdown 文本（轻量调用）</div>
+  <pre><code>// Response 200
+{ "success": true, "data": { "markdown": "# ..." } }</code></pre>
+</div>
+
+<!-- Images List -->
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="badge badge-get">GET</span>
+    <code class="endpoint-path">/tasks/{task_id}/images</code>
+  </div>
+  <div class="endpoint-desc">列出所有生成的图片</div>
+  <pre><code>// Response 200
+{
+  "success": true,
+  "data": {
+    "images": ["page0_img1.png", "page1_img1.png"],
+    "count": 2,
+    "base_url": "/api/v1/tasks/{task_id}/images/"
+  }
+}</code></pre>
+</div>
+
+<!-- Image File -->
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="badge badge-get">GET</span>
+    <code class="endpoint-path">/tasks/{task_id}/images/{filename}</code>
+  </div>
+  <div class="endpoint-desc">获取指定图片文件（返回图片二进制，Content-Type: image/png）</div>
+</div>
+
+<!-- Download ZIP -->
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="badge badge-get">GET</span>
+    <code class="endpoint-path">/tasks/{task_id}/download</code>
+  </div>
+  <div class="endpoint-desc">打包下载 Markdown + 图片（ZIP 格式）</div>
+</div>
+
+<!-- Download MD -->
+<div class="endpoint">
+  <div class="endpoint-header">
+    <span class="badge badge-get">GET</span>
+    <code class="endpoint-path">/tasks/{task_id}/download/markdown</code>
+  </div>
+  <div class="endpoint-desc">直接下载 Markdown 文件</div>
+</div>
+
+<h2>状态码</h2>
+<table class="status-table">
+  <tr><th>状态码</th><th>含义</th></tr>
+  <tr><td>200</td><td>请求成功</td></tr>
+  <tr><td>202</td><td>任务已创建（异步处理中）</td></tr>
+  <tr><td>400</td><td>请求参数错误</td></tr>
+  <tr><td>401</td><td>认证失败</td></tr>
+  <tr><td>404</td><td>资源不存在（任务/图片/文件）</td></tr>
+  <tr><td>409</td><td>任务尚未完成，无法获取结果</td></tr>
+</table>
+
+<h2>调用示例</h2>
+
+<h3>cURL</h3>
+<pre><code># 1. 上传 PDF 开始转换
+curl -X POST http://localhost:23504/api/v1/convert \
+  -H "X-API-Key: your-key" \
+  -F "file=@document.pdf" \
+  -F "model=qwen3.5-plus"
+
+# 2. 查询任务状态
+curl http://localhost:23504/api/v1/tasks/TASK_ID \
+  -H "X-API-Key: your-key"
+
+# 3. 获取转换结果
+curl http://localhost:23504/api/v1/tasks/TASK_ID/result \
+  -H "X-API-Key: your-key"
+
+# 4. 下载 ZIP 包
+curl -OJ http://localhost:23504/api/v1/tasks/TASK_ID/download \
+  -H "X-API-Key: your-key"</code></pre>
+
+<h3>Python</h3>
+<pre><code>import requests
+import time
+
+BASE = "http://localhost:23504/api/v1"
+HEADERS = {"X-API-Key": "your-key"}  # 未设置 MDFY_API_KEY 可省略
+
+# 1. 上传 PDF
+with open("document.pdf", "rb") as f:
+    resp = requests.post(f"{BASE}/convert",
+        headers=HEADERS,
+        files={"file": f},
+        data={"model": "qwen3.5-plus"},
+    )
+task_id = resp.json()["data"]["task_id"]
+print(f"任务已创建: {task_id}")
+
+# 2. 轮询等待完成
+while True:
+    status = requests.get(f"{BASE}/tasks/{task_id}",
+        headers=HEADERS).json()["data"]
+    print(f"状态: {status['status']} ({status['elapsed_seconds']}s)")
+    if status["status"] == "done":
+        break
+    if status["status"] == "error":
+        raise Exception(status["error"])
+    time.sleep(3)
+
+# 3. 获取 Markdown 结果
+result = requests.get(f"{BASE}/tasks/{task_id}/result",
+    headers=HEADERS).json()["data"]
+print(f"转换完成，{result['image_count']} 张图片")
+print(result["markdown"][:500])
+
+# 4. 或者直接下载 ZIP
+resp = requests.get(f"{BASE}/tasks/{task_id}/download",
+    headers=HEADERS)
+with open("result.zip", "wb") as f:
+    f.write(resp.content)</code></pre>
+
+<h3>JavaScript (Node.js)</h3>
+<pre><code>const FormData = require("form-data");
+const fs = require("fs");
+const fetch = require("node-fetch");
+
+const BASE = "http://localhost:23504/api/v1";
+const HEADERS = { "X-API-Key": "your-key" };
+
+async function convert(pdfPath) {
+  // 1. 上传
+  const form = new FormData();
+  form.append("file", fs.createReadStream(pdfPath));
+  form.append("model", "qwen3.5-plus");
+
+  const uploadResp = await fetch(`${BASE}/convert`, {
+    method: "POST",
+    headers: HEADERS,
+    body: form,
+  });
+  const { data: { task_id } } = await uploadResp.json();
+  console.log(`任务已创建: ${task_id}`);
+
+  // 2. 轮询
+  while (true) {
+    const statusResp = await fetch(`${BASE}/tasks/${task_id}`, { headers: HEADERS });
+    const { data } = await statusResp.json();
+    if (data.status === "done") break;
+    if (data.status === "error") throw new Error(data.error);
+    await new Promise(r => setTimeout(r, 3000));
+  }
+
+  // 3. 获取结果
+  const resultResp = await fetch(`${BASE}/tasks/${task_id}/result`, { headers: HEADERS });
+  const { data: result } = await resultResp.json();
+  console.log(`完成！${result.image_count} 张图片`);
+  return result.markdown;
+}
+
+convert("document.pdf").then(md => console.log(md.slice(0, 500)));</code></pre>
+
+<h3>SSE 实时进度（JavaScript）</h3>
+<pre><code>// 浏览器或 Node.js (需 eventsource polyfill)
+const es = new EventSource(
+  "http://localhost:23504/api/v1/tasks/TASK_ID/progress"
+);
+
+es.onmessage = (event) => {
+  console.log("[日志]", event.data);
+};
+
+es.addEventListener("done", (event) => {
+  const { elapsed } = JSON.parse(event.data);
+  console.log(`✅ 转换完成，耗时 ${elapsed}s`);
+  es.close();
+});
+
+es.addEventListener("error", (event) => {
+  console.error("❌ 转换失败:", event.data);
+  es.close();
+});</code></pre>
+
+<hr style="border-color: var(--border); margin: 3rem 0 1rem;">
+<p style="color: var(--muted); font-size: .85rem; text-align: center;">
+  mdfy API v1 · 由 Qwen 多模态模型驱动 · <a href="/api/v1/docs">JSON Schema</a>
+</p>
+
+</div>
+
+<script>
+  // 自动更新 baseUrl 为当前访问地址
+  const baseEl = document.getElementById("baseUrl");
+  if (baseEl) baseEl.textContent = location.origin + "/api/v1";
+</script>
+</body>
+</html>
