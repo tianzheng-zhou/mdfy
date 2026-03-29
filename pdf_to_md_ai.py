@@ -1631,7 +1631,8 @@ def _dedup_page_boundary(prev_text, curr_text):
     for n in range(1, max_check + 1):
         prev_tail_lines = [l.strip() for l in prev_lines[-n:]]
         curr_head_lines = [l.strip() for l in curr_lines[:n]]
-        if prev_tail_lines == curr_head_lines and all(l for l in prev_tail_lines):
+        # any() 允许含空行的块匹配（如 图片+空行+说明文字），但排除纯空行匹配
+        if prev_tail_lines == curr_head_lines and any(l for l in prev_tail_lines):
             overlap_lines = n
 
     if overlap_lines > 0:
@@ -1654,6 +1655,45 @@ def _dedup_page_boundary(prev_text, curr_text):
                 return trimmed.lstrip('\n')
 
     return curr_text
+
+
+# ── 泄漏页眉清理 ──────────────────────────────────────────────
+
+
+def _remove_running_headers(text: str) -> str:
+    """移除泄漏到正文中的页眉（书名/文档标题在页面顶部的重复出现）。
+
+    策略：提取首个 # 标题作为文档标题，移除正文中与标题完全匹配的
+    独立行（非标题行、非表格行、非列表项、非引用块）。
+    """
+    # 提取文档标题
+    m = re.search(r'^# (.+)$', text, re.MULTILINE)
+    if not m:
+        return text
+    doc_title = m.group(1).strip()
+    if len(doc_title) < 2:
+        return text
+
+    lines = text.split('\n')
+    to_remove = set()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == doc_title:
+            # 确保不是标题行本身
+            if line.lstrip().startswith('#'):
+                continue
+            # 确保不在表格、列表、引用块内
+            if stripped.startswith(('|', '-', '*', '>', '`')):
+                continue
+            # 确保不是版权信息中的书名行（前后行含出版社/ISBN 等）
+            ctx_lines = [lines[j].strip() for j in range(max(0, i - 2), min(len(lines), i + 3)) if j != i]
+            if any('ISBN' in cl or '出版' in cl or '书 名' in cl or '书名' in cl for cl in ctx_lines):
+                continue
+            to_remove.add(i)
+
+    if to_remove:
+        lines = [l for i, l in enumerate(lines) if i not in to_remove]
+    return '\n'.join(lines)
 
 
 # ── 已转写表格的图片引用清理 ────────────────────────────────────────
@@ -2301,6 +2341,9 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
     # 5.6 移除内容仅为表格的嵌入图片引用（表格已转写为 markdown，图片冗余）
     md_content = _remove_redundant_table_images(md_content)
 
+    # 5.7 移除泄漏到正文中的页眉（书名在页面顶部的重复出现）
+    md_content = _remove_running_headers(md_content)
+
     # 统一换行符（API 可能返回 \r\n）
     md_content = md_content.replace('\r\n', '\n').replace('\r', '\n')
 
@@ -2484,6 +2527,26 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
                 prev_heading = None
         deduped.append(line)
     md_content = '\n'.join(deduped)
+
+    # 通用后处理：将 <!-- 图：... --> 注释转为可见的引用块
+    # LLM 在无法提取图片时会生成 HTML 注释占位符，但渲染时不可见
+    md_content = re.sub(
+        r'^<!-- (图[：:].+?) -->$',
+        r'> **[\1]**',
+        md_content,
+        flags=re.MULTILINE,
+    )
+
+    # 通用后处理：去除连续重复段落（跨页拼接可能产生相邻的完全重复段落）
+    def _dedup_consecutive_paragraphs(text):
+        paragraphs = re.split(r'\n\n+', text)
+        result = []
+        for para in paragraphs:
+            if result and para.strip() == result[-1].strip():
+                continue
+            result.append(para)
+        return '\n\n'.join(result)
+    md_content = _dedup_consecutive_paragraphs(md_content)
 
     # ── 通用后处理：合并跨页断裂的段落 ──
     # 检测模式：正文行（不以句末标点结尾）\n\n续接文字 → 合并为同一段落
@@ -2890,6 +2953,17 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
                 lines[i] = line[:len(line) - len(line.lstrip())] + rest.lstrip()
         return '\n'.join(lines)
     md_content = _remove_orphan_boundary_fragments(md_content)
+
+    # 移除连续重复的图片+说明文字块（拼接去重遗漏时的安全网）
+    def _remove_duplicate_image_blocks(text):
+        """移除连续重复的图片块：同一图片引用连续出现两次且后续说明文字相同。"""
+        # 匹配: 图片行 + 空行 + 说明段落 + 空行，紧接完全相同的块
+        return re.sub(
+            r'(!\[[^\]]*\]\([^)]+\)\n\n[^\n]+\n)\n\1',
+            r'\1',
+            text,
+        )
+    md_content = _remove_duplicate_image_blocks(md_content)
 
     # 通用后处理：清理引用了不存在图片的 markdown 图片标记
     def _remove_ghost_images(text, base_dir):
