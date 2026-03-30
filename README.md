@@ -158,6 +158,7 @@ curl http://localhost:23504/api/v1/models?api_key=your-key
 启动服务后访问：
 - **交互式文档页面**：http://localhost:23504/api/docs
 - **JSON Schema**：http://localhost:23504/api/v1/docs
+- **Markdown 文档**：项目根目录的 `API_DOCS.md`
 
 ## 模型选择
 
