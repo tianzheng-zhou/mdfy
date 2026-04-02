@@ -336,9 +336,15 @@ def _detect_image_rotation(transform):
 
 
 def extract_and_save_images(doc, page, page_num, images_dir):
-    """提取并保存页面中的原始图片，返回图片文件名列表"""
+    """提取并保存页面中的原始图片，返回图片文件名列表。
+
+    跳过覆盖页面面积 >80% 的全页嵌入图片——这类图片是页面渲染的载体而非
+    有意义的独立图表，页面渲染图已包含其全部信息。保留它们会在后续合并时
+    挤掉 AI 裁切的精确子图。
+    """
     saved = []
     image_list = page.get_images(full=True)
+    page_area = page.rect.width * page.rect.height
     # 获取图片变换矩阵，用于检测旋转
     image_info = page.get_image_info(xrefs=True)
     xref_transforms = {}
@@ -350,6 +356,18 @@ def extract_and_save_images(doc, page, page_num, images_dir):
     for img_index, img in enumerate(image_list):
         xref = img[0]
         try:
+            # 过滤全页嵌入图片（覆盖页面面积 >80%）
+            try:
+                rects = page.get_image_rects(xref)
+                if rects:
+                    rect = rects[0]
+                    img_area = (rect.x1 - rect.x0) * (rect.y1 - rect.y0)
+                    if page_area > 0 and img_area / page_area > 0.80:
+                        print(f"  [skip fullpage img{img_index+1} ({img_area/page_area:.0%})]", end=" ", flush=True)
+                        continue
+            except Exception:
+                pass
+
             pix = fitz.Pixmap(doc, xref)
             if pix.colorspace and pix.colorspace.n > 4:
                 pix = fitz.Pixmap(fitz.csRGB, pix)
@@ -1226,9 +1244,10 @@ SYSTEM_PROMPT = """\
 
 <critical_rules>
 <rule id="no_fabrication">
-只输出页面上用文字排版写出的正文内容。
+精确转写页面截图中可见的所有正文内容——包括文字、公式、列表等。
+⚠️ PDF 的文本层（extracted_text）可能不完整甚至为空，此时必须直接从截图中 OCR 读取内容。
 截图/界面图中的 UI 文字（按钮名、标签页名、菜单项等）不属于正文，不要转写为标题或段落。
-如果一页上正文文字极少或完全没有，只放图片引用即可。
+不要添加任何页面上不存在的内容或解释。
 </rule>
 
 <rule id="no_page_artifacts">
@@ -1461,8 +1480,13 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
             f"  </instructions>"
         )
     else:
+        # 通用：当文本层极薄时（<50字符），提示模型依赖截图 OCR
+        ocr_hint = ""
+        if len(page_text) < 50:
+            ocr_hint = "    - ⚠️ 本页 PDF 文本层极少或缺失，请直接从页面截图中 OCR 读取所有可见的文字、公式和内容\n"
         instructions = (
             f"  <instructions>\n"
+            f"{ocr_hint}"
             f"    - 延续大纲中的标题层级和编号，不要重复已有的标题\n"
             f"    - 本页有 {len(image_filenames)} 张图片（已按页面从上到下排序，pos 属性为纵向位置百分比）；请严格按照 pos 位置将每张图片插入到对应位置的文本中间；仅代码截图已完整转写的可省略，其余必须引用\n"
             f"    - 代码/脚本/数据数组必须用 ``` 围栏包裹\n"
