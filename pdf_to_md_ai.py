@@ -578,10 +578,12 @@ def _merge_ai_and_embedded_images(page, doc, ai_filenames, ai_pixel_bboxes, embe
             embedded_pixel_bboxes.append(None)
 
     # ── 第2步：反向去重 — 移除被嵌入图覆盖的AI裁切 ──
+    # 关键：一个AI裁切可能横跨多张嵌入图（如logo+chart），需要将所有嵌入图的
+    # 覆盖面积加总来判断，而不是只看单张嵌入图是否 >50%。
     kept_ai_indices = []
     for ai_idx, (ax1, ay1, ax2, ay2) in enumerate(ai_pixel_bboxes):
         ai_area = max((ax2 - ax1) * (ay2 - ay1), 1)
-        is_covered_by_embed = False
+        total_inter = 0
         for eb in embedded_pixel_bboxes:
             if eb is None:
                 continue
@@ -589,10 +591,8 @@ def _merge_ai_and_embedded_images(page, doc, ai_filenames, ai_pixel_bboxes, embe
             ix1, iy1 = max(ax1, ex1), max(ay1, ey1)
             ix2, iy2 = min(ax2, ex2), min(ay2, ey2)
             if ix1 < ix2 and iy1 < iy2:
-                inter = (ix2 - ix1) * (iy2 - iy1)
-                if inter / ai_area > 0.50:
-                    is_covered_by_embed = True
-                    break
+                total_inter += (ix2 - ix1) * (iy2 - iy1)
+        is_covered_by_embed = total_inter / ai_area > 0.50
         if is_covered_by_embed:
             fname = ai_filenames[ai_idx]
             try:
@@ -632,7 +632,35 @@ def _merge_ai_and_embedded_images(page, doc, ai_filenames, ai_pixel_bboxes, embe
         else:
             kept_embedded.append(filename)
 
-    return kept_ai + kept_embedded
+    # ── 第4步：文字区域误检过滤 — 移除 AI 裁切中以文字为主的区域 ──
+    # AI 视觉检测有时把彩色文字或段落区域误判为图/表，这类区域不与嵌入图重叠
+    # 所以不会被前面的 dedup 捕获。用 PyMuPDF 文本块检测文字覆盖率。
+    text_blocks = [b for b in page.get_text("blocks") if b[6] == 0]  # type 0 = text
+    final_ai = []
+    for fname, bbox_px in zip(kept_ai, kept_ai_bboxes):
+        ax1, ay1, ax2, ay2 = bbox_px
+        # 像素坐标 → 页面坐标
+        px0, py0 = ax1 / scale_x, ay1 / scale_y
+        px1, py1 = ax2 / scale_x, ay2 / scale_y
+        ai_page_area = max((px1 - px0) * (py1 - py0), 1)
+        text_overlap = 0
+        for b in text_blocks:
+            bx0, by0, bx1, by1 = b[:4]
+            ix0, iy0 = max(px0, bx0), max(py0, by0)
+            ix1, iy1 = min(px1, bx1), min(py1, by1)
+            if ix0 < ix1 and iy0 < iy1:
+                text_overlap += (ix1 - ix0) * (iy1 - iy0)
+        text_ratio = text_overlap / ai_page_area
+        if text_ratio > 0.40:
+            try:
+                os.remove(os.path.join(images_dir, fname))
+            except OSError:
+                pass
+            print(f"[{fname}:reject(文字区域{text_ratio:.0%})]", end=" ", flush=True)
+        else:
+            final_ai.append(fname)
+
+    return final_ai + kept_embedded
 
 
 def _compute_image_positions(image_filenames, page_png_bytes, fig_bboxes=None, page=None):
@@ -640,24 +668,43 @@ def _compute_image_positions(image_filenames, page_png_bytes, fig_bboxes=None, p
 
     fig_bboxes: {filename: (x1,y1,x2,y2)} AI检测/裁切的像素坐标
     page: PyMuPDF 页面对象（用于获取嵌入图位置）
-    返回 (sorted_filenames, positions_dict)，positions_dict: {filename: "~XX%"}
+    返回 (sorted_filenames, positions_dict, coverage_pct, bboxes_pdf)
+      positions_dict 值格式如 "~20%-50% 右半"
+      coverage_pct: 图片总覆盖面积占页面比例 (0-100)
+      bboxes_pdf: {filename: (x0,y0,x1,y1)} PDF坐标系的bbox
     """
     if not image_filenames:
-        return [], {}
+        return [], {}, 0, {}
 
     from PIL import Image
     pil_img = Image.open(io.BytesIO(page_png_bytes))
+    page_width = pil_img.width
     page_height = pil_img.height
 
-    items = []  # [(filename, y_center)]
+    items = []  # [(filename, y_top, y_bottom, x_left, x_right)]
+    bboxes_pdf = {}  # {filename: (x0, y0, x1, y1)} in PDF coordinate space
+
+    # 计算像素→PDF坐标的转换因子
+    pdf_scale_x = page.rect.width / page_width if page is not None and page_width > 0 else 1.0
+    pdf_scale_y = page.rect.height / page_height if page is not None and page_height > 0 else 1.0
 
     for fname in image_filenames:
-        y_center = None
+        y_top = None
+        y_bottom = None
+        x_left = None
+        x_right = None
+        pdf_bbox = None  # (x0, y0, x1, y1) in PDF coords
 
         # 1. AI/crop bbox（像素坐标）
         if fig_bboxes and fname in fig_bboxes:
             bbox = fig_bboxes[fname]
-            y_center = (bbox[1] + bbox[3]) / 2
+            x_left = bbox[0]
+            y_top = bbox[1]
+            x_right = bbox[2]
+            y_bottom = bbox[3]
+            # 转换为 PDF 坐标
+            pdf_bbox = (x_left * pdf_scale_x, y_top * pdf_scale_y,
+                        x_right * pdf_scale_x, y_bottom * pdf_scale_y)
 
         # 2. 嵌入图：从 PDF 页面获取位置
         elif page is not None:
@@ -670,28 +717,94 @@ def _compute_image_positions(image_filenames, page_png_bytes, fig_bboxes=None, p
                         xref = image_list[img_idx][0]
                         rects = page.get_image_rects(xref)
                         if rects:
+                            scale_x = page_width / page.rect.width
                             scale_y = page_height / page.rect.height
                             rect = rects[0]
-                            ey1 = rect.y0 * scale_y
-                            ey2 = rect.y1 * scale_y
-                            y_center = (ey1 + ey2) / 2
+                            # 保存 PDF 坐标 bbox
+                            pdf_bbox = (rect.x0, rect.y0, rect.x1, rect.y1)
+                            x_left = rect.x0 * scale_x
+                            y_top = rect.y0 * scale_y
+                            x_right = rect.x1 * scale_x
+                            y_bottom = rect.y1 * scale_y
                 except Exception:
                     pass
 
-        if y_center is None:
-            y_center = page_height / 2  # fallback
+        if y_top is None:
+            y_top = page_height * 0.3
+            y_bottom = page_height * 0.7
+            x_left = page_width * 0.1
+            x_right = page_width * 0.9
+            pdf_bbox = None  # 无法确定，不标注
 
-        items.append((fname, y_center))
+        y_center = (y_top + y_bottom) / 2
+        x_center = (x_left + x_right) / 2
+        items.append((fname, y_center, y_top, y_bottom, x_left, x_right, x_center))
+        if pdf_bbox is not None:
+            bboxes_pdf[fname] = pdf_bbox
 
     items.sort(key=lambda x: x[1])
 
+    # 计算图片覆盖面积（简单求和，不计重叠）
+    page_area = page_width * page_height
+    total_img_area = 0
+    for _, _, yt, yb, xl, xr, _ in items:
+        total_img_area += (xr - xl) * (yb - yt)
+    coverage_pct = round(total_img_area / page_area * 100) if page_area > 0 else 0
+
     sorted_filenames = [it[0] for it in items]
     positions = {}
-    for fname, y_center in items:
-        pct = round(y_center / page_height * 100) if page_height > 0 else 50
-        positions[fname] = f"~{pct}%"
+    for fname, y_center, y_top, y_bottom, x_left, x_right, x_center in items:
+        top_pct = round(y_top / page_height * 100) if page_height > 0 else 30
+        bot_pct = round(y_bottom / page_height * 100) if page_height > 0 else 70
+        # 水平位置提示
+        x_ratio = x_center / page_width if page_width > 0 else 0.5
+        if x_ratio < 0.35:
+            positions[fname] = f"~{top_pct}%-{bot_pct}% 左半"
+        elif x_ratio > 0.65:
+            positions[fname] = f"~{top_pct}%-{bot_pct}% 右半"
+        else:
+            positions[fname] = f"~{top_pct}%-{bot_pct}%"
 
-    return sorted_filenames, positions
+    return sorted_filenames, positions, coverage_pct, bboxes_pdf
+
+
+def _compute_text_in_images(page, bboxes_pdf):
+    """计算每张图片bbox内包含的文本块。
+
+    page: PyMuPDF 页面对象
+    bboxes_pdf: {filename: (x0, y0, x1, y1)} PDF坐标系的bbox
+    返回 {filename: "摘要文本"} — 每张图片内文字的摘要（截断到80字符）
+    """
+    if not bboxes_pdf or page is None:
+        return {}
+
+    text_blocks = page.get_text("blocks")  # (x0, y0, x1, y1, text, block_no, block_type)
+    result = {}
+
+    for fname, (ix0, iy0, ix1, iy1) in bboxes_pdf.items():
+        overlapping_texts = []
+        for b in text_blocks:
+            if b[6] != 0:  # 跳过图片块
+                continue
+            bx0, by0, bx1, by1 = b[0], b[1], b[2], b[3]
+            text = b[4].strip()
+            if not text:
+                continue
+            # 计算文本块与图片bbox的重叠面积
+            overlap_x = max(0, min(bx1, ix1) - max(bx0, ix0))
+            overlap_y = max(0, min(by1, iy1) - max(by0, iy0))
+            block_area = max((bx1 - bx0) * (by1 - by0), 1)
+            overlap_area = overlap_x * overlap_y
+            # 文本块50%以上面积在图片内 → 认为该文本属于图片
+            if overlap_area / block_area > 0.5:
+                first_line = text.split('\n')[0].strip()
+                if first_line:
+                    overlapping_texts.append(first_line[:40])
+        if overlapping_texts:
+            summary = ', '.join(overlapping_texts)
+            result[fname] = summary[:80]
+
+    return result
 
 
 def _merge_figure_lists(*fig_lists):
@@ -1403,13 +1516,25 @@ SYSTEM_PROMPT = """\
 
 <rule id="images">
 我会告诉你本页有哪些图片文件名。默认每张图片都必须用 ![](images/文件名) 引用。
-图片列表已按页面从上到下排序，每个 <img> 标签有 pos 属性表示纵向位置百分比——请严格按照 pos 位置将图片插入到对应位置的文本中间。
+图片列表已按页面从上到下排序，每个 <img> 标签有 pos 属性表示该图片在页面上覆盖的纵向范围和水平区域，格式为 "~起始%-结束%" 或 "~起始%-结束% 左半/右半"。
+如果 <img> 有 contains_text 属性，说明该图片区域内包含 PDF 文本层中的这些文字——**这些文字已经在图片中了，绝不能再输出为 Markdown**。
+
+**图片放置与文字去重规则：**
+1. 将图片插入到对应 pos 范围所指示的位置。图片应紧跟在该区域的小标题之后。
+2. 图片覆盖范围内的文字（标注、说明、数据、公式、表格等）已经包含在图片中——**不要重复转写**。只提取该区域的标题作为 Markdown 标题，然后直接放图片引用。
+3. 图片覆盖范围之外的正文文字，正常转写。
+4. 在多列布局（PPT/幻灯片等）中，先处理左列内容，再处理右列内容。每列内部按从上到下顺序。
+
 **必须省略**图片引用的情况（不是可选，是强制）：
-- 如果一张图片的内容**仅仅是表格/数据**，且你已将其完整转写为 Markdown 表格 → 必须省略图片引用，只保留 Markdown 表格
-- 如果一张图片的内容**仅仅是代码/脚本文字**，且你已完整转写为代码块 → 必须省略图片引用，只保留代码块
-判断方法：先看图片内容，再决定是否已转写。如果图片内容和你输出的 Markdown 表格/代码块完全一致，就必须省略。
-界面截图、操作步骤截图、示意图、对话框截图、任何包含 GUI 元素的图片，一律保留引用，即使你描述了其内容。
-拿不准的时候，保留图片引用。
+- 如果一张图片的内容**仅仅是表格/数据**（不含任何图表、示意图、公式图），且你已将其完整转写为 Markdown 表格 → 必须省略图片引用，只保留 Markdown 表格
+- 如果一张图片的内容**仅仅是代码/脚本文字**（不含任何图表或示意图），且你已完整转写为代码块 → 必须省略图片引用，只保留代码块
+
+**必须保留图片引用且不要转写其中内容**的情况：
+- 图片同时包含表格/数据**和**图表/示意图/公式图 → 保留图片引用，**不要**单独转写其中的表格或数据
+- 图片包含流程图、原理图、照片、UI截图等视觉内容和文字混合 → 保留图片引用，不要转写图中文字
+
+判断方法：先看图片覆盖区域内除了表格/代码之外是否还有图表、示意图等视觉元素。只有"纯表格"或"纯代码"才能转写并省略图片。混合内容的图片一律保留引用、不转写其中的结构化数据。
+拿不准的时候，保留图片引用、不转写区域内文字。
 </rule>
 
 <rule id="code_blocks">
@@ -1478,7 +1603,8 @@ def _build_outline(all_md_parts):
 def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenames,
                           page_num, total_pages, prev_md_tail="", outline="",
                           pdf_type="digital", page_image_mime="image/png",
-                          image_positions=None):
+                          image_positions=None, image_coverage=0,
+                          text_in_images=None):
     """调用 Qwen 多模态模型转换单页"""
 
     is_scanned = (pdf_type == "scanned")
@@ -1487,14 +1613,30 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
     # 图片清单（带位置提示，按从上到下排序）
     if image_filenames:
         if image_positions:
-            img_list = '\n'.join(
-                f'    <img pos="{image_positions.get(f, "")}">{f}</img>'
-                for f in image_filenames
-            )
+            img_lines = []
+            for f in image_filenames:
+                pos_attr = f' pos="{image_positions.get(f, "")}"'
+                # 标注图片内已有的文字（帮助模型避免重复转写）
+                overlap_attr = ''
+                if text_in_images and f in text_in_images:
+                    overlap_attr = f' contains_text="{text_in_images[f]}"'
+                img_lines.append(f'    <img{pos_attr}{overlap_attr}>{f}</img>')
+            img_list = '\n'.join(img_lines)
         else:
             img_list = '\n'.join(f'    <img>{f}</img>' for f in image_filenames)
+        # 图片覆盖率高时（>30%页面面积），加重警告避免重复转写
+        coverage_attr = f' coverage="{image_coverage}%"' if image_coverage > 0 else ''
+        coverage_warning = ""
+        if image_coverage >= 30:
+            coverage_warning = (
+                f"\n    ⚠️ 本页约 {image_coverage}% 的面积被图片覆盖。"
+                f"大部分可见内容已包含在图片中。严格遵守规则："
+                f"仅输出图片区域外的标题/正文，然后引用图片。"
+                f"图片区域内的表格、数据、公式、文字一律不要转写。"
+            )
         img_section = (
-            f"<images count=\"{len(image_filenames)}\" note=\"已按页面从上到下排序\">\n"
+            f"<images count=\"{len(image_filenames)}\"{coverage_attr} note=\"已按页面从上到下排序\">"
+            f"{coverage_warning}\n"
             f"{img_list}\n"
             f"  </images>"
         )
@@ -1608,7 +1750,7 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
     if is_scanned:
         img_instructions = ""
         if image_filenames:
-            img_instructions = f"    - 本页有 {len(image_filenames)} 张已裁切的图片（已按页面从上到下排序，pos 属性为纵向位置百分比）；请严格按照 pos 位置将每张图片插入到对应位置的文本中间，用 ![描述](images/文件名) 引用\n"
+            img_instructions = f"    - 本页有 {len(image_filenames)} 张已裁切的图片（已按页面从上到下排序，pos 表示覆盖范围，contains_text 列出图内已有的文字）；请在对应位置放置图片引用 ![描述](images/文件名)，图片范围内的文字/表格/数据不要重复转写\n"
         instructions = (
             f"  <instructions>\n"
             f"    - 精确 OCR 页面上的所有正文文字\n"
@@ -1634,7 +1776,7 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
             f"  <instructions>\n"
             f"{ocr_hint}"
             f"    - 延续大纲中的标题层级和编号，不要重复已有的标题\n"
-            f"    - 本页有 {len(image_filenames)} 张图片（已按页面从上到下排序，pos 属性为纵向位置百分比）；请严格按照 pos 位置将每张图片插入到对应位置的文本中间；仅代码截图已完整转写的可省略，其余必须引用\n"
+            f"    - 本页有 {len(image_filenames)} 张图片（已按页面从上到下排序，pos 表示覆盖范围，contains_text 列出图内已有的文字）；图片范围内的文字/表格/数据不要重复转写；仅纯代码/纯表格截图已完整转写的可省略，混合内容图片一律保留引用\n"
             f"    - 代码/脚本/数据数组必须用 ``` 围栏包裹\n"
             f"    - 忽略页眉、页脚、页码，不要输出到 Markdown\n"
             f"    - 目录页的条目用列表（- 条目），不要用标题标记\n"
@@ -2491,8 +2633,9 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
                 else:
                     image_filenames = []
                     fig_bboxes = {}
-                image_filenames, image_positions = _compute_image_positions(
+                image_filenames, image_positions, img_coverage, img_bboxes_pdf = _compute_image_positions(
                     image_filenames, pd['page_png'], fig_bboxes=fig_bboxes, page=page)
+                text_in_images = _compute_text_in_images(page, img_bboxes_pdf)
             else:
                 embedded_filenames = pd['embedded_filenames']
                 if fig_results:
@@ -2508,8 +2651,9 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
                 else:
                     image_filenames = embedded_filenames
                     fig_bboxes = {}
-                image_filenames, image_positions = _compute_image_positions(
+                image_filenames, image_positions, img_coverage, img_bboxes_pdf = _compute_image_positions(
                     image_filenames, pd['page_png'], fig_bboxes=fig_bboxes, page=page)
+                text_in_images = _compute_text_in_images(page, img_bboxes_pdf)
 
             # Phase D: 构建上下文 + AI 转换（顺序，需要 prev_tail）
             prev_tail = ""
@@ -2528,6 +2672,8 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
                     pdf_type=pdf_type,
                     page_image_mime=pd['page_api_mime'],
                     image_positions=image_positions,
+                    image_coverage=img_coverage,
+                    text_in_images=text_in_images,
                 )
                 if not md_part or not md_part.strip():
                     print(f"⚠空 ({time.time() - start:.1f}s) 模型返回空内容，使用文本层回退")

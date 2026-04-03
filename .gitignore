@@ -2,3 +2,7 @@
 __pycache__/
 test-files/
 uploads/
+
+# Ignore test files and directories
+_test*
+test*/
