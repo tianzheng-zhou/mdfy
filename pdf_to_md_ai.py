@@ -335,13 +335,60 @@ def _detect_image_rotation(transform):
     return rounded if rounded % 360 != 0 else 0
 
 
-def extract_and_save_images(doc, page, page_num, images_dir):
+def _find_decorative_xrefs(doc):
+    """预扫描全文档，找出跨页重复的装饰性图片 xref（logo/页脚图标等）。
+
+    判断条件（数据驱动）：
+    - 同一 xref 出现在 >50% 的页面上
+    - 页面面积占比 <10%（排除真正的内容图片被复用的情况）
+    """
+    from collections import Counter
+    total_pages = len(doc)
+    if total_pages < 3:
+        return set()
+    xref_page_count = Counter()
+    xref_area_pct = {}
+    for pg_idx in range(total_pages):
+        page = doc[pg_idx]
+        page_area = page.rect.width * page.rect.height
+        seen_on_page = set()
+        for img in page.get_images(full=True):
+            xref = img[0]
+            if xref in seen_on_page:
+                continue
+            seen_on_page.add(xref)
+            xref_page_count[xref] += 1
+            if xref not in xref_area_pct and page_area > 0:
+                try:
+                    rects = page.get_image_rects(xref)
+                    if rects:
+                        r = rects[0]
+                        xref_area_pct[xref] = (r.width * r.height) / page_area
+                except Exception:
+                    pass
+    threshold = total_pages * 0.5
+    decorative = set()
+    for xref, count in xref_page_count.items():
+        if count > threshold and xref_area_pct.get(xref, 1.0) < 0.10:
+            decorative.add(xref)
+    if decorative:
+        print(f"  [decorative xrefs: {decorative} (skipped on {len(decorative)} repeated images)]")
+    return decorative
+
+
+def extract_and_save_images(doc, page, page_num, images_dir, *, decorative_xrefs=None):
     """提取并保存页面中的原始图片，返回图片文件名列表。
 
     跳过覆盖页面面积 >80% 的全页嵌入图片——这类图片是页面渲染的载体而非
     有意义的独立图表，页面渲染图已包含其全部信息。保留它们会在后续合并时
     挤掉 AI 裁切的精确子图。
+
+    跳过装饰性图片（跨页重复的 logo/图标，由 decorative_xrefs 标记）。
+
+    检测空间上相邻的碎片图（同一图被 PDF 拆成多个 xref）→ 合并为单张图。
     """
+    if decorative_xrefs is None:
+        decorative_xrefs = set()
     saved = []
     image_list = page.get_images(full=True)
     page_area = page.rect.width * page.rect.height
@@ -353,42 +400,132 @@ def extract_and_save_images(doc, page, page_num, images_dir):
         tf = info.get('transform')
         if xr and tf:
             xref_transforms[xr] = tf
+
+    # --- 第一遍：收集所有图片的矩形信息，过滤全页图和装饰图 ---
+    candidates = []  # [(img_index, xref, rect), ...]
     for img_index, img in enumerate(image_list):
         xref = img[0]
+        if xref in decorative_xrefs:
+            continue
         try:
-            # 过滤全页嵌入图片（覆盖页面面积 >80%）
-            try:
-                rects = page.get_image_rects(xref)
-                if rects:
-                    rect = rects[0]
-                    img_area = (rect.x1 - rect.x0) * (rect.y1 - rect.y0)
-                    if page_area > 0 and img_area / page_area > 0.80:
-                        print(f"  [skip fullpage img{img_index+1} ({img_area/page_area:.0%})]", end=" ", flush=True)
-                        continue
-            except Exception:
-                pass
+            rects = page.get_image_rects(xref)
+            if rects:
+                rect = rects[0]
+                img_area = (rect.x1 - rect.x0) * (rect.y1 - rect.y0)
+                if page_area > 0 and img_area / page_area > 0.80:
+                    print(f"  [skip fullpage img{img_index+1} ({img_area/page_area:.0%})]", end=" ", flush=True)
+                    continue
+                # 低分辨率拉伸背景检测：源像素极少 + 显示面积 >30% → 背景纹理/渐变
+                if page_area > 0 and img_area / page_area > 0.30:
+                    try:
+                        pix_check = fitz.Pixmap(doc, xref)
+                        src_pixels = pix_check.width * pix_check.height
+                        ref_dpi = 150
+                        display_pixels = (rect.width * ref_dpi / 72) * (rect.height * ref_dpi / 72)
+                        pix_check = None
+                        if display_pixels > 0 and src_pixels / display_pixels < 0.05:
+                            print(f"  [skip bg-texture img{img_index+1} (density={src_pixels/display_pixels:.1%})]", end=" ", flush=True)
+                            continue
+                    except Exception:
+                        pass
+                candidates.append((img_index, xref, rect))
+            else:
+                candidates.append((img_index, xref, None))
+        except Exception:
+            candidates.append((img_index, xref, None))
 
-            pix = fitz.Pixmap(doc, xref)
-            if pix.colorspace and pix.colorspace.n > 4:
-                pix = fitz.Pixmap(fitz.csRGB, pix)
-            filename = f"page{page_num + 1}_img{img_index + 1}.png"
+    # --- 第二遍：检测空间相邻的碎片图组 ---
+    groups = _group_adjacent_images(candidates)
+
+    # --- 第三遍：提取/合并 ---
+    for group in groups:
+        if len(group) > 1 and all(r is not None for _, _, r in group):
+            # 多图合并：计算并集矩形，从页面渲染
+            rects = [r for _, _, r in group]
+            union = fitz.Rect(rects[0])
+            for r in rects[1:]:
+                union |= r
+            # DPI 匹配原始嵌入图分辨率（取最高）
+            render_dpi = 200
+            for _, xr, r in group:
+                try:
+                    pix = fitz.Pixmap(doc, xr)
+                    dpi_x = pix.width / (r.width / 72) if r.width > 0 else 200
+                    render_dpi = max(render_dpi, dpi_x)
+                    pix = None
+                except Exception:
+                    pass
+            render_dpi = min(render_dpi, 400)  # 上限防爆
+            mat = fitz.Matrix(render_dpi / 72, render_dpi / 72)
+            merged_pix = page.get_pixmap(matrix=mat, clip=union)
+            first_idx = group[0][0]
+            filename = f"page{page_num + 1}_img{first_idx + 1}.png"
             filepath = os.path.join(images_dir, filename)
-            pix.save(filepath)
-            pix = None
-            # 检测并修正 PDF 变换矩阵中的旋转
-            tf = xref_transforms.get(xref)
-            if tf:
-                rotation = _detect_image_rotation(tf)
-                if rotation != 0:
-                    from PIL import Image
-                    with Image.open(filepath) as im:
-                        # PDF 坐标系 y 轴向上，PIL y 轴向下，旋转方向取反
-                        corrected = im.rotate(-rotation, expand=True)
-                        corrected.save(filepath)
+            merged_pix.save(filepath)
+            merged_pix = None
+            merged_indices = [str(i + 1) for i, _, _ in group]
+            print(f"  [merge img{'&'.join(merged_indices)} → {filename}]", end=" ", flush=True)
             saved.append(filename)
-        except Exception as e:
-            print(f"  ⚠ 第{page_num+1}页图片{img_index+1}提取失败: {e}")
+        else:
+            # 单图或缺矩形：按 xref 逐个提取
+            for img_index, xref, rect in group:
+                try:
+                    pix = fitz.Pixmap(doc, xref)
+                    if pix.colorspace and pix.colorspace.n > 4:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    filename = f"page{page_num + 1}_img{img_index + 1}.png"
+                    filepath = os.path.join(images_dir, filename)
+                    pix.save(filepath)
+                    pix = None
+                    # 检测并修正 PDF 变换矩阵中的旋转
+                    tf = xref_transforms.get(xref)
+                    if tf:
+                        rotation = _detect_image_rotation(tf)
+                        if rotation != 0:
+                            from PIL import Image
+                            with Image.open(filepath) as im:
+                                corrected = im.rotate(-rotation, expand=True)
+                                corrected.save(filepath)
+                    saved.append(filename)
+                except Exception as e:
+                    print(f"  ⚠ 第{page_num+1}页图片{img_index+1}提取失败: {e}")
     return saved
+
+
+def _group_adjacent_images(candidates):
+    """将空间上垂直相邻的碎片图分到同一组。
+
+    判断条件（数据驱动，不依赖 PDF 类型）：
+    - 两图 y 间距 ∈ [-2, 5] pt（允许舍入误差的微小重叠，排除大面积层叠）
+    - 水平重叠 > 50%（排除恰好上下但不相关的小图）
+    """
+    GAP_Y_MAX = 5      # 点，最大垂直间距
+    GAP_Y_MIN = -2     # 点，最小垂直间距（允许微小舍入重叠）
+    OVERLAP_X = 0.5    # 水平重叠比例阈值
+
+    with_rect = [(i, x, r) for i, x, r in candidates if r is not None]
+    without_rect = [(i, x, r) for i, x, r in candidates if r is None]
+    if not with_rect:
+        return [[(i, x, r)] for i, x, r in candidates] if candidates else []
+    with_rect.sort(key=lambda t: t[2].y0)
+    groups = [[with_rect[0]]]
+    for item in with_rect[1:]:
+        prev_rect = groups[-1][-1][2]
+        curr_rect = item[2]
+        gap = curr_rect.y0 - prev_rect.y1
+        if GAP_Y_MIN <= gap <= GAP_Y_MAX:
+            overlap_x0 = max(prev_rect.x0, curr_rect.x0)
+            overlap_x1 = min(prev_rect.x1, curr_rect.x1)
+            overlap_w = max(0, overlap_x1 - overlap_x0)
+            min_w = min(prev_rect.width, curr_rect.width)
+            if min_w > 0 and overlap_w / min_w > OVERLAP_X:
+                groups[-1].append(item)
+                continue
+        groups.append([item])
+    # 无矩形的图各自一组
+    for item in without_rect:
+        groups.append([item])
+    return groups
 
 
 def _merge_ai_and_embedded_images(page, doc, ai_filenames, ai_pixel_bboxes, embedded_filenames,
@@ -411,13 +548,20 @@ def _merge_ai_and_embedded_images(page, doc, ai_filenames, ai_pixel_bboxes, embe
     scale_y = img.height / page.rect.height
 
     # ── 第1步：计算所有嵌入图的像素坐标 ──
+    # 注意：embedded_filenames 经过装饰图/全页图过滤，其位置 ≠ page.get_images() 索引。
+    # 必须从文件名解析原始 img_index（page1_img3.png → img_index=2）来正确映射 xref。
     image_list = page.get_images(full=True)
     embedded_pixel_bboxes = []  # 与 embedded_filenames 一一对应，None 表示无法获取
-    for idx, filename in enumerate(embedded_filenames):
-        if idx >= len(image_list):
+    for filename in embedded_filenames:
+        m = re.search(r'_img(\d+)\.png$', filename)
+        if not m:
             embedded_pixel_bboxes.append(None)
             continue
-        xref = image_list[idx][0]
+        img_idx = int(m.group(1)) - 1  # 0-based index into original image_list
+        if img_idx >= len(image_list):
+            embedded_pixel_bboxes.append(None)
+            continue
+        xref = image_list[img_idx][0]
         try:
             rects = page.get_image_rects(xref)
             if not rects:
@@ -1200,7 +1344,8 @@ SYSTEM_PROMPT_SCANNED = """\
 如果页面上有插图、图表等非文字内容：
 - 如果我提供了 <images> 列表中的图片文件名，严格按照每个 <img> 标签的 pos 属性（纵向位置百分比）将图片插入到对应位置的文本中间，用 ![描述](images/文件名) 引用
 - 如果没有提供图片文件名，用 `<!-- 图：[简要描述] -->` 标注其位置和内容
-- 表格：尽量转写为 Markdown 表格。如果一张图片的内容仅仅是表格，且你已完整转写为 Markdown 表格，则省略该图片引用
+- 表格：尽量转写为 Markdown 表格。如果一张图片的内容**仅仅是表格**，且你已完整转写为 Markdown 表格，**必须**省略该图片引用，只保留 Markdown 表格
+- 代码同理：如果一张图片内容仅仅是代码，且你已完整转写为代码块，必须省略该图片引用
 </rule>
 
 <rule id="heading_levels">
@@ -1258,10 +1403,10 @@ SYSTEM_PROMPT = """\
 <rule id="images">
 我会告诉你本页有哪些图片文件名。默认每张图片都必须用 ![](images/文件名) 引用。
 图片列表已按页面从上到下排序，每个 <img> 标签有 pos 属性表示纵向位置百分比——请严格按照 pos 位置将图片插入到对应位置的文本中间。
-可以省略图片引用的情况：
-- 如果一张图片的内容**仅仅是代码/脚本文字**，且你已经完整转写为代码块
-- 如果一张图片的内容**仅仅是表格**（无论本页还是上一页已转写），且该表格已被完整转写为 Markdown 表格
-以上两种情况下，省略图片引用，不要重复展示已转写的内容。
+**必须省略**图片引用的情况（不是可选，是强制）：
+- 如果一张图片的内容**仅仅是表格/数据**，且你已将其完整转写为 Markdown 表格 → 必须省略图片引用，只保留 Markdown 表格
+- 如果一张图片的内容**仅仅是代码/脚本文字**，且你已完整转写为代码块 → 必须省略图片引用，只保留代码块
+判断方法：先看图片内容，再决定是否已转写。如果图片内容和你输出的 Markdown 表格/代码块完全一致，就必须省略。
 界面截图、操作步骤截图、示意图、对话框截图、任何包含 GUI 元素的图片，一律保留引用，即使你描述了其内容。
 拿不准的时候，保留图片引用。
 </rule>
@@ -2239,6 +2384,9 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
     all_md_parts = []
     page_images_map = {}  # page_num -> [filename, ...] 跟踪每页裁切的图片
 
+    # 预扫描：检测跨页重复的装饰性图片（logo/页眉页脚图标等）
+    decorative_xrefs = _find_decorative_xrefs(doc)
+
     for page_num in range(total_pages):
         page = doc[page_num]
 
@@ -2281,7 +2429,8 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
                 image_filenames, page_png, fig_bboxes=fig_bboxes, page=page)
         else:
             # 数字PDF：嵌入图片提取 + AI 视觉检测（混合策略，确保不丢失图片信息）
-            embedded_filenames = extract_and_save_images(doc, page, page_num, str(images_dir))
+            embedded_filenames = extract_and_save_images(doc, page, page_num, str(images_dir),
+                                                           decorative_xrefs=decorative_xrefs)
 
             # AI 检测页面中的图表/图形区域（补充嵌入提取无法覆盖的矢量图/组合图）
             try:
@@ -2334,8 +2483,13 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
                 page_image_mime=page_api_mime,
                 image_positions=image_positions,
             )
-            elapsed = time.time() - start
-            print(f"OK ({elapsed:.1f}s)")
+            # 防御：API 返回空内容（非异常）时回退到文本层
+            if not md_part or not md_part.strip():
+                print(f"⚠空 ({time.time() - start:.1f}s) 模型返回空内容，使用文本层回退")
+                md_part = page_text if page_text else f"<!-- 第{page_num+1}页转换失败 -->"
+            else:
+                elapsed = time.time() - start
+                print(f"OK ({elapsed:.1f}s)")
         except Exception as e:
             elapsed = time.time() - start
             print(f"❌ ({elapsed:.1f}s) {e}")
@@ -2358,6 +2512,17 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
     # 5. 智能拼接所有页面：LLM 辅助去重 + 断句合并
     print(f"\n  拼接 {len(all_md_parts)} 页...", end="", flush=True)
     md_content = _join_pages_smart(all_md_parts, client=client)
+
+    # 5.1 内容完整性检查：检测 stitch/后处理是否丢失了整页内容
+    _missing_pages = []
+    for pg, filenames in page_images_map.items():
+        if not any(fname in md_content for fname in filenames):
+            _missing_pages.append(pg + 1)
+    if _missing_pages:
+        print(f"\n  ⚠ 检测到 {len(_missing_pages)} 页图片全部丢失: {_missing_pages}，执行回退拼接")
+        # 回退：不使用 LLM stitch，直接 \n\n 拼接
+        md_content = "\n\n".join(part for part in all_md_parts if part.strip())
+
 
     # 5.5 归一化跨页编号标题层级（不同 LLM 调用可能给同级标题不同的 # 层级）
     md_content = _normalize_sibling_headings(md_content)
