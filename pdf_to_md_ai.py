@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from pathlib import Path
 from dotenv import load_dotenv
@@ -2349,6 +2350,40 @@ def _join_pages_smart(parts, client=None):
     return "".join(result_parts)
 
 
+def _detect_figures_for_page(client, model, page_png, page_num, images_dir,
+                             pdf_type, embedded_filenames=None):
+    """并行阶段：检测 + 裁切 + AI 验证单页的图表区域。无 fitz 依赖。
+
+    返回 fig_results (list of (filename, desc, pixel_bbox)) 或 None。
+    """
+    try:
+        figures = detect_page_figures(client, model, page_png, page_num)
+    except Exception as e:
+        print(f"  ⚠ 第{page_num+1}页图片检测失败: {e}")
+        figures = []
+
+    if not figures:
+        return None
+
+    fig_results = crop_and_save_figures(page_png, figures, page_num, str(images_dir))
+    if fig_results:
+        kwargs = {}
+        if pdf_type != "scanned" and embedded_filenames:
+            kwargs["other_images"] = embedded_filenames
+        fig_results = _ai_verify_and_refine_crops(
+            client, model, page_png, fig_results,
+            page_num, str(images_dir),
+            **kwargs,
+        )
+    return fig_results if fig_results else None
+
+
+# ── 并行工作线程数（图片检测阶段） ──
+# qwen3.5-plus / qwen3.5-flash 限流极宽松：30,000 RPM / 5-10M TPM
+# 每页约 2 次 API 调用（detect + verify），单次 3-8s，实际并发远低于限流上限
+_FIGURE_DETECT_WORKERS = 20
+
+
 # ── 主流程 ──────────────────────────────────────────────────────────
 
 def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
@@ -2387,118 +2422,127 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
     # 预扫描：检测跨页重复的装饰性图片（logo/页眉页脚图标等）
     decorative_xrefs = _find_decorative_xrefs(doc)
 
+    # ══════════════════════════════════════════════════════════════
+    # Phase A: 预处理所有页面（顺序执行，fitz 操作，快速）
+    # ══════════════════════════════════════════════════════════════
+    page_data = []
+    print("  Phase A: 预处理页面...", flush=True)
     for page_num in range(total_pages):
         page = doc[page_num]
-
-        # 1. 渲染页面为图片
         page_png = render_page_to_image(page)
         page_api_image, page_api_mime, _ = prepare_image_for_model(
-            page_png,
-            max_side=OCR_IMAGE_MAX_SIDE,
+            page_png, max_side=OCR_IMAGE_MAX_SIDE,
         )
-
-        # 2. 提取文本层
         page_text = extract_page_text(page)
 
-        # 3. 提取并保存图片
-        if pdf_type == "scanned":
-            # 扫描件：用 AI 视觉定位检测页面中的图表/插图区域，裁切保存
+        embedded_filenames = []
+        if pdf_type != "scanned":
+            embedded_filenames = extract_and_save_images(
+                doc, page, page_num, str(images_dir),
+                decorative_xrefs=decorative_xrefs,
+            )
+
+        page_data.append({
+            'page_num': page_num,
+            'page_png': page_png,
+            'page_api_image': page_api_image,
+            'page_api_mime': page_api_mime,
+            'page_text': page_text,
+            'embedded_filenames': embedded_filenames,
+        })
+        print(f"\r  Phase A: 预处理页面 [{page_num+1}/{total_pages}]", end="", flush=True)
+    print()
+
+    # ══════════════════════════════════════════════════════════════
+    # Phase B+C+D: 并行图片检测 + 顺序转换（流水线）
+    #   - 工作线程：并行执行 detect_figures + crop + verify（API 调用）
+    #   - 主线程：顺序执行 merge + convert（需要 prev_tail 跨页上下文）
+    #   流水线效果：主线程等 convert API 响应时，工作线程处理后续页
+    # ══════════════════════════════════════════════════════════════
+    with ThreadPoolExecutor(max_workers=_FIGURE_DETECT_WORKERS) as pool:
+        # 提交所有页面的图片检测任务
+        futures = {}
+        for pd in page_data:
+            fut = pool.submit(
+                _detect_figures_for_page,
+                client, model, pd['page_png'], pd['page_num'],
+                images_dir, pdf_type, pd['embedded_filenames'],
+            )
+            futures[pd['page_num']] = fut
+
+        # 顺序处理每页：等待图片检测 → merge → convert
+        for page_num in range(total_pages):
+            pd = page_data[page_num]
+            page = doc[page_num]
+
+            # 等待本页的图片检测完成
             try:
-                figures = detect_page_figures(client, model, page_png, page_num)
+                fig_results = futures[page_num].result()
             except Exception as e:
                 print(f"  ⚠ 第{page_num+1}页图片检测失败: {e}")
-                figures = []
-            if figures:
-                fig_results = crop_and_save_figures(page_png, figures, page_num, str(images_dir))
-                # AI 验证裁切质量：可 accept/reject/adjust/split
-                if fig_results:
-                    fig_results = _ai_verify_and_refine_crops(
-                        client, model, page_png, fig_results,
-                        page_num, str(images_dir),
-                    )
-                image_filenames = [f[0] for f in fig_results]
-                # 构建图片文件名→描述的映射，传给 OCR 调用
-                fig_desc_map = {f[0]: f[1] for f in fig_results}
-                fig_bboxes = {f[0]: f[2] for f in fig_results}
-                print(f"[img:{len(image_filenames)}]", end=" ", flush=True)
-            else:
-                image_filenames = []
-                fig_bboxes = {}
-            # 按纵向位置排序并计算位置百分比
-            image_filenames, image_positions = _compute_image_positions(
-                image_filenames, page_png, fig_bboxes=fig_bboxes, page=page)
-        else:
-            # 数字PDF：嵌入图片提取 + AI 视觉检测（混合策略，确保不丢失图片信息）
-            embedded_filenames = extract_and_save_images(doc, page, page_num, str(images_dir),
-                                                           decorative_xrefs=decorative_xrefs)
+                fig_results = None
 
-            # AI 检测页面中的图表/图形区域（补充嵌入提取无法覆盖的矢量图/组合图）
+            # Phase C: merge + compute_positions（快速，fitz 操作）
+            if pdf_type == "scanned":
+                if fig_results:
+                    image_filenames = [f[0] for f in fig_results]
+                    fig_bboxes = {f[0]: f[2] for f in fig_results}
+                    print(f"[img:{len(image_filenames)}]", end=" ", flush=True)
+                else:
+                    image_filenames = []
+                    fig_bboxes = {}
+                image_filenames, image_positions = _compute_image_positions(
+                    image_filenames, pd['page_png'], fig_bboxes=fig_bboxes, page=page)
+            else:
+                embedded_filenames = pd['embedded_filenames']
+                if fig_results:
+                    ai_filenames = [f[0] for f in fig_results]
+                    ai_pixel_bboxes = [f[2] for f in fig_results]
+                    image_filenames = _merge_ai_and_embedded_images(
+                        page, doc, ai_filenames, ai_pixel_bboxes, embedded_filenames,
+                        pd['page_png'], str(images_dir),
+                    )
+                    fig_bboxes = {f[0]: f[2] for f in fig_results}
+                    print(f"[AI:{len(ai_filenames)} embed:{len(embedded_filenames)}->"
+                          f"{len(image_filenames) - len(ai_filenames)}]", end=" ", flush=True)
+                else:
+                    image_filenames = embedded_filenames
+                    fig_bboxes = {}
+                image_filenames, image_positions = _compute_image_positions(
+                    image_filenames, pd['page_png'], fig_bboxes=fig_bboxes, page=page)
+
+            # Phase D: 构建上下文 + AI 转换（顺序，需要 prev_tail）
+            prev_tail = ""
+            if all_md_parts:
+                tail_len = 1200 if pdf_type == "scanned" else 500
+                prev_tail = all_md_parts[-1][-tail_len:]
+            outline = _build_outline(all_md_parts)
+
+            print(f"  [{page_num + 1}/{total_pages}]", end=" ", flush=True)
+            start = time.time()
             try:
-                figures = detect_page_figures(client, model, page_png, page_num)
-            except Exception as e:
-                print(f"  ⚠ 第{page_num+1}页AI图片检测失败: {e}")
-                figures = []
-
-            if figures:
-                fig_results = crop_and_save_figures(page_png, figures, page_num, str(images_dir))
-                # AI 验证裁切质量：可 accept/reject/adjust/split
-                if fig_results:
-                    fig_results = _ai_verify_and_refine_crops(
-                        client, model, page_png, fig_results,
-                        page_num, str(images_dir),
-                        other_images=embedded_filenames,
-                    )
-                ai_filenames = [f[0] for f in fig_results]
-                ai_pixel_bboxes = [f[2] for f in fig_results]
-                # 合并：AI检测图 + 非重叠嵌入图（去除被AI覆盖的嵌入图）
-                image_filenames = _merge_ai_and_embedded_images(
-                    page, doc, ai_filenames, ai_pixel_bboxes, embedded_filenames,
-                    page_png, str(images_dir),
+                md_part = convert_page_with_ai(
+                    client, model, pd['page_api_image'], pd['page_text'], image_filenames,
+                    page_num, total_pages,
+                    prev_md_tail=prev_tail, outline=outline,
+                    pdf_type=pdf_type,
+                    page_image_mime=pd['page_api_mime'],
+                    image_positions=image_positions,
                 )
-                fig_bboxes = {f[0]: f[2] for f in fig_results}
-                print(f"[AI:{len(ai_filenames)} embed:{len(embedded_filenames)}->{len(image_filenames) - len(ai_filenames)}]", end=" ", flush=True)
-            else:
-                image_filenames = embedded_filenames
-                fig_bboxes = {}
-            # 按纵向位置排序并计算位置百分比
-            image_filenames, image_positions = _compute_image_positions(
-                image_filenames, page_png, fig_bboxes=fig_bboxes, page=page)
-
-        # 4. 构建滚动上下文：大纲 + 上一页末尾
-        prev_tail = ""
-        if all_md_parts:
-            # 扫描件需要更长的尾部来帮助模型识别跨页截断
-            tail_len = 1200 if pdf_type == "scanned" else 500
-            prev_tail = all_md_parts[-1][-tail_len:]
-        outline = _build_outline(all_md_parts)
-
-        print(f"  [{page_num + 1}/{total_pages}]", end=" ", flush=True)
-        start = time.time()
-        try:
-            md_part = convert_page_with_ai(
-                client, model, page_api_image, page_text, image_filenames,
-                page_num, total_pages,
-                prev_md_tail=prev_tail, outline=outline,
-                pdf_type=pdf_type,
-                page_image_mime=page_api_mime,
-                image_positions=image_positions,
-            )
-            # 防御：API 返回空内容（非异常）时回退到文本层
-            if not md_part or not md_part.strip():
-                print(f"⚠空 ({time.time() - start:.1f}s) 模型返回空内容，使用文本层回退")
-                md_part = page_text if page_text else f"<!-- 第{page_num+1}页转换失败 -->"
-            else:
+                if not md_part or not md_part.strip():
+                    print(f"⚠空 ({time.time() - start:.1f}s) 模型返回空内容，使用文本层回退")
+                    md_part = pd['page_text'] if pd['page_text'] else f"<!-- 第{page_num+1}页转换失败 -->"
+                else:
+                    elapsed = time.time() - start
+                    print(f"OK ({elapsed:.1f}s)")
+            except Exception as e:
                 elapsed = time.time() - start
-                print(f"OK ({elapsed:.1f}s)")
-        except Exception as e:
-            elapsed = time.time() - start
-            print(f"❌ ({elapsed:.1f}s) {e}")
-            # 降级：使用原始文本
-            md_part = page_text if page_text else f"<!-- 第{page_num+1}页转换失败 -->"
+                print(f"❌ ({elapsed:.1f}s) {e}")
+                md_part = pd['page_text'] if pd['page_text'] else f"<!-- 第{page_num+1}页转换失败 -->"
 
-        all_md_parts.append(md_part)
-        if image_filenames:
-            page_images_map[page_num] = image_filenames
+            all_md_parts.append(md_part)
+            if image_filenames:
+                page_images_map[page_num] = image_filenames
 
     doc.close()
 
