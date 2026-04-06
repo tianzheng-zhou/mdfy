@@ -369,9 +369,39 @@ def _find_decorative_xrefs(doc):
                     pass
     threshold = total_pages * 0.5
     decorative = set()
+    # Phase 1: 按 xref 计数（同一 xref 跨页共享的场景）
     for xref, count in xref_page_count.items():
         if count > threshold and xref_area_pct.get(xref, 1.0) < 0.10:
             decorative.add(xref)
+
+    # Phase 2: 按 (width, height) 聚合（PPT 导出等场景中同一图片使用不同 xref）
+    # 收集每个 xref 的像素尺寸
+    xref_dims = {}
+    for pg_idx in range(total_pages):
+        page = doc[pg_idx]
+        for img in page.get_images(full=True):
+            xref = img[0]
+            if xref not in xref_dims:
+                try:
+                    info = doc.extract_image(xref)
+                    xref_dims[xref] = (info["width"], info["height"])
+                except Exception:
+                    pass
+    # 按尺寸分组，合并计数
+    from collections import defaultdict
+    dim_groups = defaultdict(set)  # (w,h) -> {xref, ...}
+    for xref, dims in xref_dims.items():
+        dim_groups[dims].add(xref)
+    for dims, xrefs in dim_groups.items():
+        if len(xrefs) < 2:
+            continue  # 单个 xref 已在 Phase 1 处理
+        total_count = sum(xref_page_count.get(x, 0) for x in xrefs)
+        avg_area = sum(xref_area_pct.get(x, 1.0) for x in xrefs if x in xref_area_pct)
+        n_with_area = sum(1 for x in xrefs if x in xref_area_pct)
+        avg_area = avg_area / n_with_area if n_with_area else 1.0
+        if total_count > threshold and avg_area < 0.10:
+            decorative.update(xrefs)
+
     if decorative:
         print(f"  [decorative xrefs: {decorative} (skipped on {len(decorative)} repeated images)]")
     return decorative
@@ -416,6 +446,14 @@ def extract_and_save_images(doc, page, page_num, images_dir, *, decorative_xrefs
                 if page_area > 0 and img_area / page_area > 0.80:
                     print(f"  [skip fullpage img{img_index+1} ({img_area/page_area:.0%})]", end=" ", flush=True)
                     continue
+                # 薄条装饰线检测：极端宽高比 + 占页面宽/高大比例 → 分隔线/装饰条
+                if rect.width > 0 and rect.height > 0:
+                    aspect = max(rect.width / rect.height, rect.height / rect.width)
+                    is_h_separator = aspect > 15 and rect.width / page.rect.width > 0.40
+                    is_v_separator = aspect > 15 and rect.height / page.rect.height > 0.40
+                    if is_h_separator or is_v_separator:
+                        print(f"  [skip separator img{img_index+1} (aspect={aspect:.0f}:1)]", end=" ", flush=True)
+                        continue
                 # 低分辨率拉伸背景检测：源像素极少 + 显示面积 >30% → 背景纹理/渐变
                 if page_area > 0 and img_area / page_area > 0.30:
                     try:
@@ -1528,6 +1566,7 @@ SYSTEM_PROMPT = """\
 **必须省略**图片引用的情况（不是可选，是强制）：
 - 如果一张图片的内容**仅仅是表格/数据**（不含任何图表、示意图、公式图），且你已将其完整转写为 Markdown 表格 → 必须省略图片引用，只保留 Markdown 表格
 - 如果一张图片的内容**仅仅是代码/脚本文字**（不含任何图表或示意图），且你已完整转写为代码块 → 必须省略图片引用，只保留代码块
+- 如果一张图片的内容**仅仅是普通正文文字**（段落、定义、说明等纯文本，不含任何图表、示意图、公式图），且你已将其完整转写为 Markdown 正文 → 必须省略图片引用，只保留正文文字
 
 **必须保留图片引用且不要转写其中内容**的情况：
 - 图片同时包含表格/数据**和**图表/示意图/公式图 → 保留图片引用，**不要**单独转写其中的表格或数据
@@ -1625,14 +1664,22 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
         else:
             img_list = '\n'.join(f'    <img>{f}</img>' for f in image_filenames)
         # 图片覆盖率高时（>30%页面面积），加重警告避免重复转写
+        # 但若文本层内容丰富（>100字符），说明图片与文字共存，不应压制文字转写
         coverage_attr = f' coverage="{image_coverage}%"' if image_coverage > 0 else ''
         coverage_warning = ""
-        if image_coverage >= 30:
+        text_is_rich = len(page_text.strip()) > 50 if page_text else False
+        if image_coverage >= 30 and not text_is_rich:
             coverage_warning = (
                 f"\n    ⚠️ 本页约 {image_coverage}% 的面积被图片覆盖。"
                 f"大部分可见内容已包含在图片中。严格遵守规则："
                 f"仅输出图片区域外的标题/正文，然后引用图片。"
                 f"图片区域内的表格、数据、公式、文字一律不要转写。"
+            )
+        elif image_coverage >= 30 and text_is_rich:
+            coverage_warning = (
+                f"\n    ⚠️ 本页约 {image_coverage}% 的面积被图片覆盖，但文本层内容丰富。"
+                f"请正常转写文本层中的所有文字、公式和内容，在合适位置插入图片引用。"
+                f"仅跳过 contains_text 属性中已列出的文字（避免重复）。"
             )
         img_section = (
             f"<images count=\"{len(image_filenames)}\"{coverage_attr} note=\"已按页面从上到下排序\">"
@@ -1921,6 +1968,117 @@ def _merge_split_list_item_paragraphs(text: str) -> str:
     return '\n'.join(merged)
 
 
+def _dedup_model_repetition(text):
+    """检测并移除单页 AI 输出中的自重复（模型幻觉循环）。
+
+    LLM 在处理图片密集页面时，容易在输出末尾重复之前的内容。
+    典型表现：图片列表 + 说明文字整块重复输出第二遍，接缝处常丢失 '!' 导致
+    broken image ref（如 '[](images/...)' 而非 '![](images/...)'）。
+
+    策略：
+    1. 修复 broken image ref、拆分粘连的图片引用行
+    2. 查找末尾与前部匹配的最长重复块（tail-duplication）
+    3. 若重复内容 >= 3 个有效行且 >= 15% 的总有效行数，剪除
+    """
+    # Step 1: 修复 broken image refs（缺少 !）
+    text = re.sub(r'(?<!\!)\[\]\(images/', '![](images/', text)
+    # Step 1b: 拆分粘连在同一行的多个图片引用
+    # 注意：用 [ \t]* 而非 \s*，避免跨行匹配破坏正常的图片间距
+    text = re.sub(
+        r'(!\[[^\]]*\]\(images/[^)]+\.png\))[ \t]*(!\[[^\]]*\]\(images/)',
+        r'\1\n\2',
+        text,
+    )
+    # Step 1c: 拆分文字+图片引用粘连（模型循环接缝处：text![](images/...)）
+    # 仅匹配非空白非!字符直接跟 ![，这不是正常 markdown 排版
+    text = re.sub(
+        r'([^\s!])(!\[[^\]]*\]\(images/)',
+        r'\1\n\2',
+        text,
+    )
+
+    lines = text.split('\n')
+    n = len(lines)
+    if n < 8:
+        return text
+
+    # 构建有效行索引 (行号, 去空白文本)
+    content = [(i, lines[i].strip()) for i in range(n) if lines[i].strip()]
+    nc = len(content)
+    if nc < 6:
+        return text
+
+    # 对每个候选重复起点 k（从 25% 位置开始），检查 content[k:end] 是否
+    # 与前面某位置 j 开始的序列匹配
+    best_dup_ci = -1
+    best_match_len = 0
+
+    for k in range(max(3, nc // 4), nc - 2):
+        target_line = content[k][1]
+        if len(target_line) < 8:
+            continue
+
+        for j in range(0, k):
+            if content[j][1] != target_line:
+                continue
+
+            # 统计从 j 和 k 开始的连续匹配行数
+            ml = 0
+            while j + ml < k and k + ml < nc:
+                if content[j + ml][1] == content[k + ml][1]:
+                    ml += 1
+                else:
+                    break
+
+            # 重复必须延伸到末尾（或接近末尾）
+            if k + ml >= nc - 1 and ml > best_match_len:
+                best_match_len = ml
+                best_dup_ci = k
+
+    # 要求：至少 3 个匹配有效行 且 >= 15% 的总有效行
+    if best_match_len >= 3 and best_match_len >= nc * 0.15:
+        dup_start_line = content[best_dup_ci][0]
+        trimmed = '\n'.join(lines[:dup_start_line]).rstrip()
+        print(f"  [dedup: removed {best_match_len} repeated lines from page output]")
+        return trimmed
+
+    # Phase 2: 中间重复块检测 — 模型输出 A + A' + B（A' 是 A 的重复，B 是新内容）
+    # 目标：去除 A'，保留 A + B
+    best_mid_ci = -1
+    best_mid_len = 0
+
+    for k in range(max(3, nc // 4), nc - 3):
+        target_line = content[k][1]
+        if len(target_line) < 8:
+            continue
+
+        for j in range(0, k):
+            if content[j][1] != target_line:
+                continue
+
+            ml = 0
+            while j + ml < k and k + ml < nc:
+                if content[j + ml][1] == content[k + ml][1]:
+                    ml += 1
+                else:
+                    break
+
+            if ml > best_mid_len and ml >= 5 and ml >= nc * 0.15:
+                best_mid_len = ml
+                best_mid_ci = k
+
+    if best_mid_len >= 5 and best_mid_len >= nc * 0.15:
+        dup_start_line = content[best_mid_ci][0]
+        dup_end_ci = best_mid_ci + best_mid_len
+        dup_end_line = content[dup_end_ci][0] if dup_end_ci < nc else len(lines)
+        trimmed_lines = lines[:dup_start_line] + lines[dup_end_line:]
+        trimmed = '\n'.join(trimmed_lines).rstrip()
+        print(f"  [dedup: removed {best_mid_len} mid-repeated lines from page output]")
+        return trimmed
+
+    return text
+
+
 def _dedup_page_boundary(prev_text, curr_text):
     """去除下一页开头与上一页末尾的重叠内容。
 
@@ -1976,38 +2134,112 @@ def _dedup_page_boundary(prev_text, curr_text):
 
 
 def _remove_running_headers(text: str) -> str:
-    """移除泄漏到正文中的页眉（书名/文档标题在页面顶部的重复出现）。
+    """移除泄漏到正文中的页眉（书名/章节标题在页面顶部的重复出现）。
 
-    策略：提取首个 # 标题作为文档标题，移除正文中与标题完全匹配的
-    独立行（非标题行、非表格行、非列表项、非引用块）。
+    三阶段处理：
+    Phase 0: 修复同一行粘连的重复标题（## Foo## Foo → ## Foo）
+    Phase 1: 移除正文中与文档主标题完全匹配的纯文本行（非标题行）
+    Phase 2: 移除与前文更高级标题文本相同的重复标题（PPT running section headers）
     """
-    # 提取文档标题
-    m = re.search(r'^# (.+)$', text, re.MULTILINE)
-    if not m:
-        return text
-    doc_title = m.group(1).strip()
-    if len(doc_title) < 2:
-        return text
+    _HEADING_RE = re.compile(r'^(#{1,6})\s+(.+)$')
+
+    # ── Phase 0: 修复同一行粘连的重复标题 ──
+    _GLUED_RE = re.compile(r'^(#{1,6})\s+(.+?)\s*(#{1,6}\s+.+)$')
+
+    def _fix_glued(line):
+        gm = _GLUED_RE.match(line)
+        if not gm:
+            return line
+        h1_hashes, h1_text, h2_full = gm.group(1), gm.group(2).rstrip(), gm.group(3)
+        m2 = _HEADING_RE.match(h2_full)
+        if not m2:
+            return line
+        h2_text = m2.group(2).strip()
+        if h1_text.strip().lower() == h2_text.lower():
+            return f'{h1_hashes} {h1_text.strip()}'
+        return f'{h1_hashes} {h1_text.strip()}\n\n{h2_full}'
 
     lines = text.split('\n')
+    lines = [_fix_glued(l) for l in lines]
+    text = '\n'.join(lines)
+    lines = text.split('\n')  # re-split since _fix_glued may insert newlines
+
+    # ── Phase 1: 文档主标题重复（非标题行） ──
+    m = re.search(r'^# (.+)$', text, re.MULTILINE)
+    doc_title = m.group(1).strip() if m else None
+
     to_remove = set()
+    if doc_title and len(doc_title) >= 2:
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped == doc_title:
+                if line.lstrip().startswith('#'):
+                    continue
+                if stripped.startswith(('|', '-', '*', '>', '`')):
+                    continue
+                ctx_lines = [lines[j].strip() for j in range(max(0, i - 2), min(len(lines), i + 3)) if j != i]
+                if any('ISBN' in cl or '出版' in cl or '书 名' in cl or '书名' in cl for cl in ctx_lines):
+                    continue
+                to_remove.add(i)
+
+    # ── Phase 2: 重复节标题（running section headers） ──
+    def _norm_heading(t):
+        t = t.strip().lower()
+        for prefix in ('the ', 'a ', 'an '):
+            if t.startswith(prefix):
+                t = t[len(prefix):]
+        return t
+
+    seen = {}  # normalized_text → (line_index, level)
+
     for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped == doc_title:
-            # 确保不是标题行本身
-            if line.lstrip().startswith('#'):
+        if i in to_remove:
+            continue
+        hm = _HEADING_RE.match(line)
+        if not hm:
+            continue
+        level = len(hm.group(1))
+        raw_text = hm.group(2).strip()
+        norm = _norm_heading(raw_text)
+        if len(norm) < 2:
+            continue
+
+        if norm in seen:
+            prev_idx, prev_level = seen[norm]
+            if level > prev_level:
+                # 更深层级 = running header（如 ## Review → ### Review）
+                to_remove.add(i)
                 continue
-            # 确保不在表格、列表、引用块内
-            if stripped.startswith(('|', '-', '*', '>', '`')):
-                continue
-            # 确保不是版权信息中的书名行（前后行含出版社/ISBN 等）
-            ctx_lines = [lines[j].strip() for j in range(max(0, i - 2), min(len(lines), i + 3)) if j != i]
-            if any('ISBN' in cl or '出版' in cl or '书 名' in cl or '书名' in cl for cl in ctx_lines):
-                continue
-            to_remove.add(i)
+            elif level == prev_level:
+                # 同级：仅在两者之间无实质内容时移除（紧邻重复）
+                has_content = False
+                for k in range(prev_idx + 1, i):
+                    if k in to_remove:
+                        continue
+                    if lines[k].strip():
+                        has_content = True
+                        break
+                if not has_content:
+                    to_remove.add(i)
+                    continue
+
+        seen[norm] = (i, level)
 
     if to_remove:
         lines = [l for i, l in enumerate(lines) if i not in to_remove]
+        # 压缩连续 3+ 空行为 2 空行
+        cleaned = []
+        blank_count = 0
+        for line in lines:
+            if line.strip() == '':
+                blank_count += 1
+                if blank_count <= 2:
+                    cleaned.append(line)
+            else:
+                blank_count = 0
+                cleaned.append(line)
+        lines = cleaned
+
     return '\n'.join(lines)
 
 
@@ -2298,9 +2530,9 @@ def _boundary_needs_stitch(prev_text, curr_text):
     if prev_complete and curr_structural:
         return False
 
-    # 情况2：prev 以标题/代码块/分隔线结尾 + curr 结构化开头
+    # 情况2：prev 以标题/代码块/分隔线/图片引用结尾 + curr 结构化开头
     prev_structural_end = bool(re.match(
-        r'^#{1,6} |^```|^---', last_line
+        r'^#{1,6} |^```|^---|^!\[', last_line
     ))
     if prev_structural_end and curr_structural:
         return False
@@ -2686,6 +2918,9 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
                 print(f"❌ ({elapsed:.1f}s) {e}")
                 md_part = pd['page_text'] if pd['page_text'] else f"<!-- 第{page_num+1}页转换失败 -->"
 
+            # 页内去重：检测并移除模型自重复（图片密集页面常见）
+            md_part = _dedup_model_repetition(md_part)
+
             all_md_parts.append(md_part)
             if image_filenames:
                 page_images_map[page_num] = image_filenames
@@ -2741,6 +2976,18 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
     md_content = re.sub(
         r'!\[\]\(images/page\d*\[]\(images/(page\d+_(?:img|fig)\d+\.png)\)',
         r'![](images/\1)',
+        md_content,
+    )
+
+    # 修复缺少 ! 的图片引用（模型自重复接缝处常见）
+    # [](images/page1_img1.png) → ![](images/page1_img1.png)
+    md_content = re.sub(r'(?<!\!)\[\]\(images/', '![](images/', md_content)
+
+    # 拆分粘连在同一行的多个图片引用
+    # 注意：用 [ \t]* 而非 \s*，避免跨行匹配破坏正常的图片间距
+    md_content = re.sub(
+        r'(!\[[^\]]*\]\(images/[^)]+\.png\))[ \t]*(!\[[^\]]*\]\(images/)',
+        r'\1\n\2',
         md_content,
     )
 
