@@ -20,7 +20,7 @@ from flask import (
 )
 
 import sys
-from pdf_to_md_ai import pdf_to_markdown_ai, AVAILABLE_MODELS, DEFAULT_MODEL, AVAILABLE_MODES, DEFAULT_MODE
+from mdfy import pdf_to_markdown_ai, AVAILABLE_MODELS, DEFAULT_MODEL, AVAILABLE_MODES, DEFAULT_MODE
 
 api_bp = Blueprint("api", __name__, url_prefix="/api/v1")
 

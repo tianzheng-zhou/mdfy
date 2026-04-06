@@ -20,7 +20,7 @@ from flask import (
     send_file, send_from_directory, Response,
 )
 
-from pdf_to_md_ai import pdf_to_markdown_ai, AVAILABLE_MODELS, DEFAULT_MODEL, AVAILABLE_MODES, DEFAULT_MODE
+from mdfy import pdf_to_markdown_ai, AVAILABLE_MODELS, DEFAULT_MODEL, AVAILABLE_MODES, DEFAULT_MODE
 from api import api_bp, init_api
 
 # ── Flask 配置 ──────────────────────────────────────────────────────
