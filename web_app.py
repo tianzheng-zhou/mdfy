@@ -20,7 +20,7 @@ from flask import (
     send_file, send_from_directory, Response,
 )
 
-from pdf_to_md_ai import pdf_to_markdown_ai, AVAILABLE_MODELS, DEFAULT_MODEL
+from pdf_to_md_ai import pdf_to_markdown_ai, AVAILABLE_MODELS, DEFAULT_MODEL, AVAILABLE_MODES, DEFAULT_MODE
 from api import api_bp, init_api
 
 # ── Flask 配置 ──────────────────────────────────────────────────────
@@ -91,6 +91,8 @@ def index():
         "index.html",
         models=AVAILABLE_MODELS,
         default_model=DEFAULT_MODEL,
+        modes=AVAILABLE_MODES,
+        default_mode=DEFAULT_MODE,
     )
 
 
@@ -99,6 +101,7 @@ def upload():
     """接收 PDF 上传，启动后台转换"""
     file = request.files.get("pdf")
     model = request.form.get("model", DEFAULT_MODEL)
+    mode = request.form.get("mode", DEFAULT_MODE)
 
     if not file or not file.filename:
         return jsonify({"error": "请选择 PDF 文件"}), 400
@@ -106,6 +109,8 @@ def upload():
         return jsonify({"error": "仅支持 PDF 格式"}), 400
     if model not in AVAILABLE_MODELS:
         model = DEFAULT_MODEL
+    if mode not in AVAILABLE_MODES:
+        mode = DEFAULT_MODE
 
     task_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:12]
     task_dir = UPLOAD_DIR / task_id
@@ -124,7 +129,7 @@ def upload():
         sys.stdout = task.log
         try:
             task.status = "converting"
-            result = pdf_to_markdown_ai(str(pdf_path), model=model)
+            result = pdf_to_markdown_ai(str(pdf_path), model=model, mode=mode)
             task.result_md = result
             task.output_dir = str(Path(result).parent)
             task.status = "done"

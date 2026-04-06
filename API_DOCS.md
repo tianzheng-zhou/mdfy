@@ -140,6 +140,8 @@ GET /api/v1/models
 
 - models: 当前服务可用模型列表
 - default: 默认模型
+- modes: 可用转换模式列表
+- default_mode: 默认转换模式
 
 返回示例：
 
@@ -149,9 +151,15 @@ GET /api/v1/models
   "data": {
     "models": [
       "qwen3.5-flash",
-      "qwen3.5-plus"
+      "qwen3.5-plus",
+      "qwen3.6-plus"
     ],
-    "default": "qwen3.5-plus"
+    "default": "qwen3.5-plus",
+    "modes": [
+      "pipeline",
+      "vision"
+    ],
+    "default_mode": "pipeline"
   },
   "error": null
 }
@@ -172,6 +180,7 @@ Content-Type: multipart/form-data
 | --- | --- | --- | --- |
 | file | File | 是 | 要转换的 PDF 文件 |
 | model | String | 否 | 模型名称；建议先通过 /models 获取当前可用列表 |
+| mode | String | 否 | 转换模式：`pipeline`（默认，管线模式）或 `vision`（纯视觉模式） |
 
 成功返回状态码：202 Accepted
 
@@ -184,6 +193,7 @@ Content-Type: multipart/form-data
     "task_id": "20260329_120000_abc123def456",
     "pdf_name": "example.pdf",
     "model": "qwen3.5-plus",
+    "mode": "pipeline",
     "status": "pending"
   },
   "error": null
@@ -195,6 +205,7 @@ Content-Type: multipart/form-data
 - 缺少 file 字段
 - 上传的不是 PDF 文件
 - model 不在服务端支持列表中
+- mode 不在服务端支持列表中
 
 ### 6.4 查询任务状态
 
@@ -458,7 +469,8 @@ GET /api/v1/docs
 curl -X POST http://127.0.0.1:23504/api/v1/convert \
   -H "X-API-Key: your-key" \
   -F "file=@document.pdf" \
-  -F "model=qwen3.5-plus"
+  -F "model=qwen3.5-plus" \
+  -F "mode=pipeline"
 
 # 2. 查询任务状态
 curl http://127.0.0.1:23504/api/v1/tasks/TASK_ID \
@@ -489,7 +501,7 @@ with open("document.pdf", "rb") as file_obj:
         f"{BASE}/convert",
         headers=HEADERS,
         files={"file": file_obj},
-        data={"model": "qwen3.5-plus"},
+        data={"model": "qwen3.5-plus", "mode": "pipeline"},
     )
     response.raise_for_status()
 
@@ -531,6 +543,7 @@ async function convert(pdfPath) {
   const form = new FormData();
   form.append("file", fs.createReadStream(pdfPath));
   form.append("model", "qwen3.5-plus");
+  form.append("mode", "pipeline");
 
   const uploadResponse = await fetch(`${BASE}/convert`, {
     method: "POST",

@@ -20,7 +20,7 @@ from flask import (
 )
 
 import sys
-from pdf_to_md_ai import pdf_to_markdown_ai, AVAILABLE_MODELS, DEFAULT_MODEL
+from pdf_to_md_ai import pdf_to_markdown_ai, AVAILABLE_MODELS, DEFAULT_MODEL, AVAILABLE_MODES, DEFAULT_MODE
 
 api_bp = Blueprint("api", __name__, url_prefix="/api/v1")
 
@@ -124,6 +124,8 @@ def list_models():
     return _ok({
         "models": AVAILABLE_MODELS,
         "default": DEFAULT_MODEL,
+        "modes": AVAILABLE_MODES,
+        "default_mode": DEFAULT_MODE,
     })
 
 
@@ -133,6 +135,7 @@ def convert():
     """上传 PDF 并启动异步转换任务"""
     file = request.files.get("file")
     model = request.form.get("model", DEFAULT_MODEL)
+    mode = request.form.get("mode", DEFAULT_MODE)
 
     if not file or not file.filename:
         return _err("缺少 PDF 文件，请通过 multipart/form-data 的 'file' 字段上传")
@@ -140,6 +143,8 @@ def convert():
         return _err("仅支持 PDF 格式文件")
     if model not in AVAILABLE_MODELS:
         return _err(f"不支持的模型: {model}，可选: {', '.join(AVAILABLE_MODELS)}")
+    if mode not in AVAILABLE_MODES:
+        return _err(f"不支持的模式: {mode}，可选: {', '.join(AVAILABLE_MODES)}")
 
     task_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:12]
     task_dir = _upload_dir / task_id
@@ -157,7 +162,7 @@ def convert():
         sys.stdout = task.log
         try:
             task.status = "converting"
-            result = pdf_to_markdown_ai(str(pdf_path), model=model)
+            result = pdf_to_markdown_ai(str(pdf_path), model=model, mode=mode)
             task.result_md = result
             task.output_dir = str(Path(result).parent)
             task.status = "done"
@@ -174,6 +179,7 @@ def convert():
         "task_id": task_id,
         "pdf_name": safe_name,
         "model": model,
+        "mode": mode,
         "status": "pending",
     }, 202)
 
@@ -388,8 +394,8 @@ def api_docs():
             {
                 "method": "GET",
                 "path": "/models",
-                "description": "列出可用的 AI 模型",
-                "response": {"models": AVAILABLE_MODELS, "default": DEFAULT_MODEL},
+                "description": "列出可用的 AI 模型和转换模式",
+                "response": {"models": AVAILABLE_MODELS, "default": DEFAULT_MODEL, "modes": AVAILABLE_MODES, "default_mode": DEFAULT_MODE},
             },
             {
                 "method": "POST",
@@ -400,12 +406,15 @@ def api_docs():
                     {"name": "file", "type": "file", "required": True, "description": "PDF 文件"},
                     {"name": "model", "type": "string", "required": False,
                      "description": f"AI 模型，默认 {DEFAULT_MODEL}，可选: {', '.join(AVAILABLE_MODELS)}"},
+                    {"name": "mode", "type": "string", "required": False,
+                     "description": f"转换模式，默认 {DEFAULT_MODE}，可选: {', '.join(AVAILABLE_MODES)}"},
                 ],
                 "response_status": 202,
                 "response": {
                     "task_id": "20260329_120000_abc123def456",
                     "pdf_name": "example.pdf",
                     "model": DEFAULT_MODEL,
+                    "mode": DEFAULT_MODE,
                     "status": "pending",
                 },
             },

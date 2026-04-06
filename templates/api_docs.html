@@ -103,13 +103,15 @@
     <span class="badge badge-get">GET</span>
     <code class="endpoint-path">/models</code>
   </div>
-  <div class="endpoint-desc">列出可用的 AI 模型</div>
+  <div class="endpoint-desc">列出可用的 AI 模型和转换模式</div>
   <pre><code>// Response 200
 {
   "success": true,
   "data": {
-    "models": ["qwen3.5-flash", "qwen3.5-plus"],
-    "default": "qwen3.5-plus"
+    "models": ["qwen3.5-flash", "qwen3.5-plus", "qwen3.6-plus"],
+    "default": "qwen3.5-plus",
+    "modes": ["pipeline", "vision"],
+    "default_mode": "pipeline"
   }
 }</code></pre>
 </div>
@@ -126,6 +128,7 @@
     <tr><th>参数</th><th>类型</th><th>必填</th><th>说明</th></tr>
     <tr><td><code>file</code></td><td>File</td><td><span class="required">必填</span></td><td>PDF 文件</td></tr>
     <tr><td><code>model</code></td><td>String</td><td>可选</td><td>AI 模型名，默认 <code>qwen3.5-plus</code></td></tr>
+    <tr><td><code>mode</code></td><td>String</td><td>可选</td><td>转换模式：<code>pipeline</code>（默认）或 <code>vision</code></td></tr>
   </table>
   <pre><code>// Response 202
 {
@@ -134,6 +137,7 @@
     "task_id": "20260329_120000_abc123def456",
     "pdf_name": "example.pdf",
     "model": "qwen3.5-plus",
+    "mode": "pipeline",
     "status": "pending"
   }
 }</code></pre>
@@ -288,7 +292,8 @@ es.addEventListener("error", (e) => {
 curl -X POST http://localhost:23504/api/v1/convert \
   -H "X-API-Key: your-key" \
   -F "file=@document.pdf" \
-  -F "model=qwen3.5-plus"
+  -F "model=qwen3.5-plus" \
+  -F "mode=pipeline"
 
 # 2. 查询任务状态
 curl http://localhost:23504/api/v1/tasks/TASK_ID \
@@ -314,7 +319,7 @@ with open("document.pdf", "rb") as f:
     resp = requests.post(f"{BASE}/convert",
         headers=HEADERS,
         files={"file": f},
-        data={"model": "qwen3.5-plus"},
+        data={"model": "qwen3.5-plus", "mode": "pipeline"},
     )
 task_id = resp.json()["data"]["task_id"]
 print(f"任务已创建: {task_id}")
@@ -355,7 +360,7 @@ async function convert(pdfPath) {
   const form = new FormData();
   form.append("file", fs.createReadStream(pdfPath));
   form.append("model", "qwen3.5-plus");
-
+  form.append("mode", "pipeline");
   const uploadResp = await fetch(`${BASE}/convert`, {
     method: "POST",
     headers: HEADERS,

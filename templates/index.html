@@ -239,6 +239,13 @@ header p{color:var(--fg2);margin-top:6px;font-size:.95rem}
       <option value="{{ m }}" {{ 'selected' if m == default_model else '' }}>{{ m }}</option>
       {% endfor %}
     </select>
+    <select id="modeSelect" title="转换模式">
+      {% for mode in modes %}
+      <option value="{{ mode }}" {{ 'selected' if mode == default_mode else '' }}>
+        {{ '🔧 管线模式' if mode == 'pipeline' else '👁 纯视觉模式' }}
+      </option>
+      {% endfor %}
+    </select>
     <button class="btn btn-primary" id="convertBtn" disabled onclick="startConvert()">
       🚀 开始转换
     </button>
@@ -300,6 +307,7 @@ const fileInput   = document.getElementById('fileInput');
 const fileName    = document.getElementById('fileName');
 const convertBtn  = document.getElementById('convertBtn');
 const modelSelect = document.getElementById('modelSelect');
+const modeSelect  = document.getElementById('modeSelect');
 const logBox      = document.getElementById('logBox');
 const progressBar = document.getElementById('progressBar');
 const statusBadge = document.getElementById('statusBadge');
@@ -343,6 +351,7 @@ async function startConvert() {
   const form = new FormData();
   form.append('pdf', selectedFile);
   form.append('model', modelSelect.value);
+  form.append('mode', modeSelect.value);
 
   try {
     const resp = await fetch('/upload', { method: 'POST', body: form });
