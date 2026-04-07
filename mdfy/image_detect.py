@@ -42,6 +42,70 @@ def _merge_figure_lists(*fig_lists):
     return merged
 
 
+def _cluster_nearby_bboxes(figures, gap_threshold=40):
+    """将空间邻近的 bbox 聚类合并为包围框。
+
+    gap_threshold: 归一化坐标下的最大间距（[0,1000]坐标系）
+    """
+    if len(figures) <= 1:
+        return figures
+
+    parent = list(range(len(figures)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(len(figures)):
+        for j in range(i + 1, len(figures)):
+            bi = figures[i]["bbox"]
+            bj = figures[j]["bbox"]
+            h_gap = max(0, max(bi[0], bj[0]) - min(bi[2], bj[2]))
+            v_gap = max(0, max(bi[1], bj[1]) - min(bi[3], bj[3]))
+            # 水平重叠度：两个 bbox 在 X 轴上的重叠/较小 bbox 宽度
+            x_overlap = max(0, min(bi[2], bj[2]) - max(bi[0], bj[0]))
+            w_i = bi[2] - bi[0]
+            w_j = bj[2] - bj[0]
+            min_w = max(min(w_i, w_j), 1)
+            x_overlap_ratio = x_overlap / min_w
+            # 垂直重叠度
+            y_overlap = max(0, min(bi[3], bj[3]) - max(bi[1], bj[1]))
+            h_i = bi[3] - bi[1]
+            h_j = bj[3] - bj[1]
+            min_h = max(min(h_i, h_j), 1)
+            y_overlap_ratio = y_overlap / min_h
+            # 合并条件：间距小 且 至少一个方向有显著重叠（>30%）
+            if max(h_gap, v_gap) < gap_threshold and (x_overlap_ratio > 0.3 or y_overlap_ratio > 0.3):
+                union(i, j)
+
+    from collections import defaultdict
+    clusters = defaultdict(list)
+    for i in range(len(figures)):
+        clusters[find(i)].append(i)
+
+    result = []
+    for indices in clusters.values():
+        if len(indices) == 1:
+            result.append(figures[indices[0]])
+        else:
+            x1 = min(figures[i]["bbox"][0] for i in indices)
+            y1 = min(figures[i]["bbox"][1] for i in indices)
+            x2 = max(figures[i]["bbox"][2] for i in indices)
+            y2 = max(figures[i]["bbox"][3] for i in indices)
+            descs = [figures[i].get("desc", "") for i in indices if figures[i].get("desc")]
+            desc = "; ".join(descs[:3]) if descs else ""
+            result.append({"bbox": [x1, y1, x2, y2], "desc": desc})
+
+    return result
+
+
 def detect_page_figures(client, model, page_png_bytes, page_num):
     """用 Qwen 视觉定位检测扫描页中的图片/图表区域。
 
@@ -57,7 +121,12 @@ def detect_page_figures(client, model, page_png_bytes, page_num):
         "<task>检测扫描书页中的视觉元素，返回精确坐标。</task>\n"
         "\n"
         "<target_elements>\n"
-        "  照片、插图、图表、图形、地图、波形图、示意图、书法作品、绘画\n"
+        "  页面中所有非纯文字的视觉内容，包括但不限于：\n"
+        "  照片、插图、图表(chart)、图形(figure)、示意图、原理图、电路图、流程图、框图、\n"
+        "  波形图、频谱图、曲线图(plot)、散点图、柱状图、饼图、\n"
+        "  结构图、截面图、分子结构图、能带图、相图、\n"
+        "  手绘草图、书法作品、绘画、地图、截屏、\n"
+        "  以及任何包含线条、符号、箭头、图案的非纯文字区域\n"
         "</target_elements>\n"
         "\n"
         "<exclude>\n"
@@ -98,165 +167,65 @@ def detect_page_figures(client, model, page_png_bytes, page_num):
                         {"type": "text", "text": prompt},
                     ]},
                 ],
-                temperature=0.1 + attempt * 0.15,
-                max_tokens=1024,
+                temperature=0.15 + attempt * 0.15,
+                max_tokens=2048,
                 extra_body={"enable_thinking": False},
             )
             raw = response.choices[0].message.content.strip()
             json_figures = parse_figure_detection_response(raw, detect_size)
             if json_figures:
                 break
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  ⚠ 第{page_num+1}页 JSON检测尝试{attempt+1}失败: {e}")
 
     qwenvl_figures = []
     try:
         raw_qwenvl = _request_qwenvl_markdown(client, model, detect_bytes, detect_mime)
         qwenvl_figures = parse_qwenvl_markdown_figures(raw_qwenvl, detect_size)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠ 第{page_num+1}页 qwenvl检测失败: {e}")
+
+    # 兜底检测：双路都空时，用更宽松的 prompt 再试一次
+    if not json_figures and not qwenvl_figures:
+        fallback_prompt = (
+            "这是一个文档页面。请检测其中所有非文字的视觉元素（图片、图表、图形、示意图、任何图案）。\n"
+            '返回 JSON: [{"bbox": [x1,y1,x2,y2], "desc": "描述"}]\n'
+            "坐标归一化 [0,1000]。无视觉元素返回 []。只输出 JSON。"
+        )
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:{detect_mime};base64,{base64.b64encode(detect_bytes).decode()}"
+                        }},
+                        {"type": "text", "text": fallback_prompt},
+                    ]},
+                ],
+                temperature=0.3,
+                max_tokens=2048,
+                extra_body={"enable_thinking": False},
+            )
+            raw = response.choices[0].message.content.strip()
+            fallback_figures = parse_figure_detection_response(raw, detect_size)
+            if fallback_figures:
+                print(f"  ✓ 第{page_num+1}页兜底检测发现{len(fallback_figures)}个图形", flush=True)
+                json_figures = fallback_figures
+        except Exception as e:
+            print(f"  ⚠ 第{page_num+1}页兜底检测失败: {e}")
 
     all_figures = _merge_figure_lists(json_figures, qwenvl_figures)
+    all_figures = _cluster_nearby_bboxes(all_figures)
     return all_figures
-
-
-def _refine_bbox_with_pixels(img, x1, y1, x2, y2):
-    """用像素分析扩展/收缩 bbox，使其精确匹配图片区域的实际边界。"""
-    import numpy as np
-
-    arr = np.array(img.convert("L"))
-    h, w = arr.shape
-
-    col_start = max(0, x1)
-    col_end = min(w, x2)
-    if col_end - col_start < 30:
-        return x1, y1, x2, y2
-
-    strip = arr[:, col_start:col_end]
-    white_ratio = (strip > 230).mean(axis=1)
-    is_text = white_ratio > 0.55
-
-    cy = (y1 + y2) // 2
-    _skip_y_expansion = False
-    if is_text[min(cy, h - 1)]:
-        best_s, best_e, best_l = cy, cy, 0
-        s = None
-        for i in range(max(0, y1), min(h, y2)):
-            if not is_text[i]:
-                if s is None:
-                    s = i
-            else:
-                if s is not None:
-                    if i - s > best_l:
-                        best_s, best_e, best_l = s, i, i - s
-                    s = None
-        if s is not None and min(h, y2) - s > best_l:
-            best_s, best_e, best_l = s, min(h, y2), min(h, y2) - s
-        if best_l < 15:
-            new_y1, new_y2 = y1, y2
-            _skip_y_expansion = True
-        else:
-            cy = (best_s + best_e) // 2
-    
-    if not _skip_y_expansion:
-        new_y1 = cy
-        consecutive_text = 0
-        for i in range(cy, -1, -1):
-            if is_text[i]:
-                consecutive_text += 1
-                if consecutive_text >= 8:
-                    new_y1 = i + consecutive_text
-                    break
-            else:
-                consecutive_text = 0
-                new_y1 = i
-        else:
-            new_y1 = 0
-
-        new_y2 = cy
-        consecutive_text = 0
-        for i in range(cy, h):
-            if is_text[i]:
-                consecutive_text += 1
-                if consecutive_text >= 8:
-                    new_y2 = i - consecutive_text + 1
-                    break
-            else:
-                consecutive_text = 0
-                new_y2 = i + 1
-        else:
-            new_y2 = h
-
-        new_y1 = max(0, new_y1 - 3)
-        new_y2 = min(h, new_y2 + 3)
-
-    row_start = max(0, new_y1)
-    row_end = min(h, new_y2)
-    if row_end - row_start < 30:
-        return x1, new_y1, x2, new_y2
-
-    h_strip = arr[row_start:row_end, :]
-    col_white_ratio = (h_strip > 230).mean(axis=0)
-
-    bbox_w = x2 - x1
-    bbox_h = new_y2 - new_y1
-    narrow_bbox = bbox_w < w * 0.35 and bbox_h > bbox_w * 1.5
-
-    if narrow_bbox:
-        content_col = col_white_ratio < 0.98
-        content_cols = np.where(content_col)[0]
-        if len(content_cols) > 5:
-            new_x1 = int(content_cols[0])
-            new_x2 = int(content_cols[-1]) + 1
-        else:
-            new_x1, new_x2 = x1, x2
-    else:
-        is_blank_col = col_white_ratio > 0.95
-        cx = (x1 + x2) // 2
-        cx = max(0, min(w - 1, cx))
-
-        new_x1 = cx
-        consecutive_blank = 0
-        for i in range(cx, -1, -1):
-            if is_blank_col[i]:
-                consecutive_blank += 1
-                if consecutive_blank >= 20:
-                    new_x1 = i + consecutive_blank
-                    break
-            else:
-                consecutive_blank = 0
-                new_x1 = i
-
-        new_x2 = cx
-        consecutive_blank = 0
-        for i in range(cx, w):
-            if is_blank_col[i]:
-                consecutive_blank += 1
-                if consecutive_blank >= 20:
-                    new_x2 = i - consecutive_blank + 1
-                    break
-            else:
-                consecutive_blank = 0
-                new_x2 = i + 1
-        else:
-            new_x2 = w
-
-    new_x1 = min(new_x1, x1)
-    new_x2 = max(new_x2, x2)
-    new_x1 = max(0, new_x1 - 3)
-    new_x2 = min(w, new_x2 + 3)
-
-    return new_x1, new_y1, new_x2, new_y2
 
 
 def crop_and_save_figures(page_png_bytes, figures, page_num, images_dir):
     """根据检测到的 bbox 裁切图片区域并保存。返回 [(文件名, 描述, 像素bbox)] 列表。"""
     from PIL import Image
-    import numpy as np
 
     img = Image.open(io.BytesIO(page_png_bytes))
     saved = []
-    page_area = img.width * img.height
     for fig_idx, fig in enumerate(figures):
         x1, y1, x2, y2 = bbox_to_pixels(fig["bbox"], img.width, img.height)
         desc = fig.get("desc", "")
@@ -267,28 +236,14 @@ def crop_and_save_figures(page_png_bytes, figures, page_num, images_dir):
         y2 = min(img.height, y2 + padding)
         fig_w = x2 - x1
         fig_h = y2 - y1
-        if fig_w < 30 or fig_h < 30:
+        _tag = f"[p{page_num+1} fig{fig_idx+1}"
+
+        # 物理不可能包含有意义内容
+        if fig_w < 20 or fig_h < 20:
+            print(f"{_tag}: skip tiny {fig_w}x{fig_h}]", end=" ", flush=True)
             continue
-        fig_area = fig_w * fig_h
-        if fig_area / page_area < 0.005:
-            continue
-        if fig_area / page_area > 0.70:
-            continue
-        x1, y1, x2, y2 = _refine_bbox_with_pixels(img, x1, y1, x2, y2)
-        fig_w = x2 - x1
-        fig_h = y2 - y1
-        fig_area = fig_w * fig_h
-        if fig_area / page_area > 0.70:
-            continue
-        aspect = fig_w / max(fig_h, 1)
-        if aspect < 0.15 or aspect > 6.5:
-            continue
-        if fig_w < 80 or fig_h < 80:
-            continue
-        cropped = img.crop((x1, y1, x2, y2))
-        arr = np.array(cropped.convert("L"))
-        if (arr > 240).mean() > 0.95:
-            continue
+
+        # IoU 去重（数学计算，非主观判断）
         cur_box = (x1, y1, x2, y2)
         is_dup = False
         for _, _, prev_box in saved:
@@ -305,10 +260,15 @@ def crop_and_save_figures(page_png_bytes, figures, page_num, images_dir):
                     is_dup = True
                     break
         if is_dup:
+            print(f"{_tag}: skip IoU-dup]", end=" ", flush=True)
             continue
+
+        # 裁切保存，质量判断全部交给 AI verify
+        cropped = img.crop((x1, y1, x2, y2))
         filename = f"page{page_num + 1}_fig{fig_idx + 1}.png"
         cropped.save(os.path.join(images_dir, filename))
         saved.append((filename, desc, (x1, y1, x2, y2)))
+
     return saved
 
 
@@ -398,8 +358,14 @@ def _ai_verify_crops(client, model, page_png_bytes, crop_results, page_num,
         "    如果包含 → adjust，缩小 bbox 排除这些内容。</check>\n"
         "  <check>【误检】该区域是否根本不是图片/图表？（纯文字段落、表格等）\n"
         "    如果是误检 → reject。</check>\n"
+        "  <check>【碎片合并】多张裁切图是否是同一个更大图形的碎片？\n"
+        "    例如：图1和图2分别只框了一幅大图的左半部分和右半部分。\n"
+        "    如果是 → 对面积最大的那张使用 adjust 扩展到覆盖完整图形，其余碎片使用 reject。</check>\n"
         "  <check>【多图合一】一个框内是否包含了多个完全独立、不相关的图形？\n"
         "    如果是 → split。注意：同一个 Figure 的多个子图（如子图a、子图b）不需要拆分。</check>\n"
+        "  <check>【空白/装饰】裁切区域是否几乎全是空白，或者只是装饰性元素（logo、校徽、水印、装饰线）？→ reject。</check>\n"
+        "  <check>【占满整页】裁切区域是否覆盖了几乎整个页面且包含大量文字段落？→ reject。但如果页面本身就是一整张图 → accept。</check>\n"
+        "  <check>【极端比例】宽高比极端的窄条是否只是装饰线/分隔线？→ reject。但有意义的宽幅图表 → accept。</check>\n"
         "</critical_checks>\n\n"
         "<available_actions>\n"
         "  accept — 裁切完整、无多余内容、无误检，保留原样\n"

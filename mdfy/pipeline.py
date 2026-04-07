@@ -1,5 +1,7 @@
 """主流程编排：pipeline 模式和 vision 模式的入口。"""
 
+import io
+import os
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -22,7 +24,7 @@ from .image_merge import (
 )
 from .image_detect import detect_page_figures
 from .convert import convert_page_with_ai, _convert_page_vision, _detect_figures_for_page
-from .dedup import _dedup_model_repetition, _review_page_quality
+from .dedup import _dedup_model_repetition, _model_review_page_quality
 from .stitch import _build_outline, _join_pages_smart
 from .postprocess import postprocess_markdown
 
@@ -39,6 +41,7 @@ def _vision_mode_convert(pdf_path, output_dir, model, client):
     doc = fitz.open(str(pdf_path))
     total_pages = len(doc)
     images_dir = output_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Phase A: 渲染所有页面为图片（顺序，快速 fitz 操作）──
     print(f"  Vision Phase A: 渲染 {total_pages} 页为图片...", flush=True)
@@ -81,6 +84,56 @@ def _vision_mode_convert(pdf_path, output_dir, model, client):
                     print(f"    第{page_num+1}页: {len(fig_results)}张图", flush=True)
             except Exception as e:
                 print(f"    ⚠ 第{page_num+1}页图片检测失败: {e}")
+
+    # ── Phase B.5: 跨页重复装饰图过滤（logo 等）──
+    if total_pages >= 3 and page_figures:
+        from collections import defaultdict
+        from PIL import Image
+        sig_pages = defaultdict(set)       # dim_signature -> set of page_nums
+        sig_crops = defaultdict(list)      # dim_signature -> [(page_num, fig_idx, area_ratio)]
+        for page_num, fig_results in page_figures.items():
+            pg_png = page_data[page_num]['page_png']
+            pg_img = Image.open(io.BytesIO(pg_png))
+            pg_area = pg_img.width * pg_img.height
+            for idx, (fname, desc, (x1, y1, x2, y2)) in enumerate(fig_results):
+                w = x2 - x1
+                h = y2 - y1
+                sig = (round(w / 10) * 10, round(h / 10) * 10)
+                sig_pages[sig].add(page_num)
+                sig_crops[sig].append((page_num, idx, (w * h) / pg_area if pg_area > 0 else 1.0))
+        threshold = total_pages * 0.5
+        decorative_sigs = set()
+        for sig, pages_set in sig_pages.items():
+            if len(pages_set) > threshold:
+                crops = sig_crops[sig]
+                avg_area = sum(c[2] for c in crops) / len(crops) if crops else 1.0
+                if avg_area < 0.08:
+                    decorative_sigs.add(sig)
+        if decorative_sigs:
+            removed = 0
+            for page_num in list(page_figures.keys()):
+                fig_results = page_figures[page_num]
+                pg_png = page_data[page_num]['page_png']
+                pg_img = Image.open(io.BytesIO(pg_png))
+                new_results = []
+                for fname, desc, (x1, y1, x2, y2) in fig_results:
+                    w = x2 - x1
+                    h = y2 - y1
+                    sig = (round(w / 10) * 10, round(h / 10) * 10)
+                    if sig in decorative_sigs:
+                        try:
+                            os.remove(str(images_dir / fname))
+                        except OSError:
+                            pass
+                        removed += 1
+                    else:
+                        new_results.append((fname, desc, (x1, y1, x2, y2)))
+                if new_results:
+                    page_figures[page_num] = new_results
+                else:
+                    del page_figures[page_num]
+            if removed:
+                print(f"  [decorative filter: removed {removed} repeated small images across pages]", flush=True)
 
     # ── Phase C: 计算图片位置（快速，无 fitz 依赖）──
     page_image_info = {}  # page_num -> (filenames, positions, coverage)
@@ -128,7 +181,9 @@ def _vision_mode_convert(pdf_path, output_dir, model, client):
             else:
                 elapsed = time.time() - start
                 # 页级质量自审
-                issues, qscore = _review_page_quality(md_part, image_filenames, page_num)
+                issues, qscore = _model_review_page_quality(
+                    client, model, pd['page_api_image'], pd['page_api_mime'],
+                    md_part, image_filenames, page_num)
                 if issues and qscore < 60:
                     print(f"⚠审({qscore}) {'; '.join(issues)} → 重试", end=" ", flush=True)
                     try:
@@ -142,7 +197,9 @@ def _vision_mode_convert(pdf_path, output_dir, model, client):
                             image_coverage=img_coverage,
                         )
                         if md_part2 and md_part2.strip():
-                            issues2, qscore2 = _review_page_quality(md_part2, image_filenames, page_num)
+                            issues2, qscore2 = _model_review_page_quality(
+                                client, model, pd['page_api_image'], pd['page_api_mime'],
+                                md_part2, image_filenames, page_num)
                             if qscore2 > qscore:
                                 md_part = md_part2
                                 print(f"✓审({qscore2})", end=" ", flush=True)
@@ -361,7 +418,9 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None, mode=None):
                     else:
                         elapsed = time.time() - start
                         # 页级质量自审
-                        issues, qscore = _review_page_quality(md_part, image_filenames, page_num)
+                        issues, qscore = _model_review_page_quality(
+                            client, model, pd['page_api_image'], pd['page_api_mime'],
+                            md_part, image_filenames, page_num)
                         if issues and qscore < 60:
                             print(f"⚠审({qscore}) {'; '.join(issues)} → 重试", end=" ", flush=True)
                             try:
@@ -376,7 +435,9 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None, mode=None):
                                     text_in_images=text_in_images,
                                 )
                                 if md_part2 and md_part2.strip():
-                                    issues2, qscore2 = _review_page_quality(md_part2, image_filenames, page_num)
+                                    issues2, qscore2 = _model_review_page_quality(
+                                        client, model, pd['page_api_image'], pd['page_api_mime'],
+                                        md_part2, image_filenames, page_num)
                                     if qscore2 > qscore:
                                         md_part = md_part2
                                         print(f"✓审({qscore2})", end=" ", flush=True)

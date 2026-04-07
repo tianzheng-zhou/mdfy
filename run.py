@@ -10,7 +10,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例:\n"
-            "  python run.py serve                  # 启动 Web 服务 (默认 0.0.0.0:8080)\n"
+            "  python run.py serve                  # 启动 Web 服务 (默认 0.0.0.0:23504)\n"
             "  python run.py serve -p 5000           # 指定端口\n"
             "  python run.py convert doc.pdf          # CLI 转换单个 PDF\n"
             "  python run.py convert doc.pdf -m qwen3.6-plus --mode vision\n"
@@ -21,7 +21,7 @@ def main():
     # ── serve ──
     srv = sub.add_parser("serve", help="启动 Web 服务")
     srv.add_argument("-H", "--host", default="0.0.0.0", help="监听地址 (默认 0.0.0.0)")
-    srv.add_argument("-p", "--port", type=int, default=8080, help="监听端口 (默认 8080)")
+    srv.add_argument("-p", "--port", type=int, default=23504, help="监听端口 (默认 23504)")
     srv.add_argument("--debug", action="store_true", help="调试模式")
 
     # ── convert ──

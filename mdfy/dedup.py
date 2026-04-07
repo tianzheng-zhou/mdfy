@@ -1,6 +1,8 @@
 """页内去重、跨页去重、页级质量审查。"""
 
 import re
+import json
+import base64
 
 
 def _dedup_model_repetition(text):
@@ -114,67 +116,71 @@ def _dedup_model_repetition(text):
     return text
 
 
-def _review_page_quality(md_part, image_filenames, page_num):
-    """页级质量自审：检测单页 AI 输出中的质量问题。
+def _model_review_page_quality(client, model, page_image_bytes, page_image_mime,
+                                md_part, image_filenames, page_num):
+    """用模型对比页面图片和生成的 Markdown，审查转换质量。
 
-    返回 (issues, score)：
-    - issues: list[str] 检测到的问题描述
-    - score: 0-100 质量分，低于阈值触发重试
+    返回 (issues: list[str], score: int)
     """
-    issues = []
-    score = 100
-
     if not md_part or not md_part.strip():
         return ["空输出"], 0
 
-    # 1. 检测 bbox 坐标泄漏：<!-- Image (x, y, x, y) --> 或类似格式
-    bbox_leaks = re.findall(r'<!--\s*Image\s*\([\d,\s]+\)\s*-->', md_part)
-    if bbox_leaks:
-        issues.append(f"bbox坐标泄漏×{len(bbox_leaks)}")
-        score -= 15 * len(bbox_leaks)
+    # 截断过长的 markdown 避免浪费 token
+    md_preview = md_part[:3000] if len(md_part) > 3000 else md_part
 
-    # 2. 检测未闭合的 $$ 公式块（奇数个 $$ 表示有截断）
-    dollar_blocks = re.findall(r'^\$\$', md_part, re.MULTILINE)
-    if len(dollar_blocks) % 2 != 0:
-        issues.append("公式块未闭合($$不配对)")
-        score -= 25
-
-    # 3. 检测 <!-- 图：... --> 占位符（模型未能引用已提供的图片）
-    fig_placeholders = re.findall(r'<!--\s*图[：:].+?-->', md_part)
-    if fig_placeholders and image_filenames:
-        # 有图片文件名却生成了占位符，说明模型没正确引用
-        issues.append(f"图片占位符×{len(fig_placeholders)}(有{len(image_filenames)}张图可用)")
-        score -= 20 * len(fig_placeholders)
-
-    # 4. 检测图片引用缺失：提供了图片但输出中完全没引用
+    img_info = ""
     if image_filenames:
-        unreferenced = [f for f in image_filenames if f not in md_part]
-        if unreferenced:
-            # 不能全怪模型——有些图可能被合理省略（纯表格/代码已转写）
-            # 但超过一半未引用大概率是问题
-            miss_ratio = len(unreferenced) / len(image_filenames)
-            if miss_ratio > 0.5:
-                issues.append(f"图片大量未引用({len(unreferenced)}/{len(image_filenames)})")
-                score -= 15
+        img_info = f"本页提供了 {len(image_filenames)} 张裁切图片: {', '.join(image_filenames)}"
 
-    # 5. 检测连续重复的图片引用行
-    img_refs = re.findall(r'!\[.*?\]\(images/[^)]+\)', md_part)
-    if len(img_refs) != len(set(img_refs)):
-        dup_count = len(img_refs) - len(set(img_refs))
-        issues.append(f"重复图片引用×{dup_count}")
-        score -= 10 * dup_count
+    prompt = (
+        f"对比这张PDF页面图片和下面的Markdown转换结果，评估转换质量。\n\n"
+        f"页码: 第{page_num + 1}页\n"
+        f"{img_info}\n\n"
+        f"<markdown_output>\n{md_preview}\n</markdown_output>\n\n"
+        "<evaluation_criteria>\n"
+        "1. 文字完整性: Markdown是否完整转写了页面上的主要文字内容？\n"
+        "2. 图片引用: 提供的图片是否在Markdown中被正确引用？\n"
+        "3. 格式正确: 公式是否正确闭合？标题层级是否合理？\n"
+        "4. 无坐标泄漏: 是否存在 bbox 坐标或内部标记泄漏到输出中？\n"
+        "</evaluation_criteria>\n\n"
+        '<output_format>\n'
+        '返回 JSON: {"score": 0-100, "issues": ["问题1", "问题2"]}\n'
+        '无问题时: {"score": 95, "issues": []}\n'
+        '只输出JSON，不要其他文字。\n'
+        '</output_format>'
+    )
 
-    # 6. 检测行内公式截断（以 \frac{...+ 或 \sum_ 等结尾，缺少 $）
-    lines = md_part.split('\n')
-    for line in lines:
-        stripped = line.rstrip()
-        if stripped and re.search(r'\\(?:frac|sum|int|sqrt)\{[^}]*$', stripped):
-            if not stripped.endswith('$') and not stripped.endswith('$$'):
-                issues.append("行内公式截断")
-                score -= 15
-                break
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {
+                    "url": f"data:{page_image_mime};base64,{base64.b64encode(page_image_bytes).decode()}"
+                }},
+                {"type": "text", "text": prompt},
+            ]}],
+            temperature=0.1,
+            max_tokens=256,
+            extra_body={"enable_thinking": False},
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+        # 模型输出可能包含未转义的反斜杠（如 LaTeX \frac），需在 JSON 解析前修复
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = raw.replace('\\', '\\\\')
+            result = json.loads(raw)
+        score = int(result.get("score", 80))
+        issues = result.get("issues", [])
+        if isinstance(issues, list):
+            return [str(i) for i in issues], score
+    except Exception as e:
+        print(f"  ⚠ 模型质量审查失败: {e}")
 
-    return issues, max(score, 0)
+    # 模型审查失败时默认通过
+    return [], 80
 
 
 def _dedup_page_boundary(prev_text, curr_text):

@@ -1,9 +1,9 @@
 """全局常量与模型配置。"""
 
 AVAILABLE_MODELS = ["qwen3.5-flash", "qwen3.5-plus", "qwen3.6-plus"]
-DEFAULT_MODEL = "qwen3.5-plus"
+DEFAULT_MODEL = "qwen3.6-plus"
 AVAILABLE_MODES = ["pipeline", "vision"]
-DEFAULT_MODE = "pipeline"
+DEFAULT_MODE = "vision"
 MODEL_IMAGE_MAX_BYTES = 7_500_000
 DETECTION_IMAGE_MAX_SIDE = 1600
 OCR_IMAGE_MAX_SIDE = 2200
