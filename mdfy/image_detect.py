@@ -106,7 +106,7 @@ def _cluster_nearby_bboxes(figures, gap_threshold=40):
     return result
 
 
-def detect_page_figures(client, model, page_png_bytes, page_num):
+def detect_page_figures(client, model, page_png_bytes, page_num, doc_context=""):
     """用 Qwen 视觉定位检测扫描页中的图片/图表区域。
 
     返回 [{"bbox": [x1,y1,x2,y2], "desc": "描述"}] 列表。
@@ -117,7 +117,12 @@ def detect_page_figures(client, model, page_png_bytes, page_num):
         max_side=DETECTION_IMAGE_MAX_SIDE,
     )
 
+    context_prefix = ""
+    if doc_context:
+        context_prefix = f"<document_context>{doc_context}</document_context>\n\n"
+
     prompt = (
+        context_prefix +
         "<task>检测扫描书页中的视觉元素，返回精确坐标。</task>\n"
         "\n"
         "<target_elements>\n"
@@ -154,12 +159,24 @@ def detect_page_figures(client, model, page_png_bytes, page_num):
         "</output_format>"
     )
 
+    detect_system = (
+        "<role>你是一个专业的文档图片检测引擎。</role>\n"
+        "<principles>\n"
+        "  <p>精确定位页面中的每一个独立图形/图表/示意图</p>\n"
+        "  <p>bbox 宁可略大也不要截断任何内容</p>\n"
+        "  <p>同一个图的子图(a)(b)(c)应该用一个大 bbox 包围</p>\n"
+        "  <p>纯文字区域、装饰性logo、页眉页脚不检测</p>\n"
+        "  <p>只输出 JSON，不要解释</p>\n"
+        "</principles>"
+    )
+
     json_figures = []
     for attempt in range(2):
         try:
             response = client.chat.completions.create(
                 model=model,
                 messages=[
+                    {"role": "system", "content": detect_system},
                     {"role": "user", "content": [
                         {"type": "image_url", "image_url": {
                             "url": f"data:{detect_mime};base64,{base64.b64encode(detect_bytes).decode()}"
@@ -188,6 +205,7 @@ def detect_page_figures(client, model, page_png_bytes, page_num):
     # 兜底检测：双路都空时，用更宽松的 prompt 再试一次
     if not json_figures and not qwenvl_figures:
         fallback_prompt = (
+            context_prefix +
             "这是一个文档页面。请检测其中所有非文字的视觉元素（图片、图表、图形、示意图、任何图案）。\n"
             '返回 JSON: [{"bbox": [x1,y1,x2,y2], "desc": "描述"}]\n'
             "坐标归一化 [0,1000]。无视觉元素返回 []。只输出 JSON。"
@@ -296,7 +314,7 @@ def _draw_bbox_overlay(page_png_bytes, bboxes_px):
 
 
 def _ai_verify_crops(client, model, page_png_bytes, crop_results, page_num,
-                     images_dir, *, round_num=0, other_images=None):
+                     images_dir, *, round_num=0, other_images=None, doc_context=""):
     """AI 验证裁切质量，返回每张裁切的动作列表。"""
     import json
 
@@ -343,12 +361,18 @@ def _ai_verify_crops(client, model, page_png_bytes, crop_results, page_num,
             "如果某张裁切图与已有图片高度重叠（覆盖相同视觉元素），应 reject 该裁切。\n"
         )
 
+    context_hint = ""
+    if doc_context:
+        context_hint = f"<document_context>{doc_context}</document_context>\n\n"
+
     prompt = (
+        context_hint +
         f"这是第{page_num + 1}页的原始图片（带编号框标注裁切区域），"
         f"后面依次是 {len(crop_results)} 张裁切结果。\n\n"
         f"裁切信息：\n" + "\n".join(crops_desc) + "\n"
         f"{other_info}\n"
-        "<task>严格评估每张裁切图的质量。对照原始页面仔细检查。</task>\n\n"
+        "<task>评估每张裁切图的质量。对照原始页面仔细检查。\n"
+        "重要：默认倾向是 accept。只有在明确确认问题时才使用 reject。</task>\n\n"
         "<critical_checks>\n"
         "  <check>【完整性】对照原始页面：裁切框是否覆盖了该图形的完整区域？\n"
         "    仔细检查框的上下左右是否有内容被截掉。\n"
@@ -356,16 +380,16 @@ def _ai_verify_crops(client, model, page_png_bytes, crop_results, page_num,
         "    如果截掉了内容 → adjust，提供覆盖完整图形的新 bbox。</check>\n"
         "  <check>【页眉页脚】裁切是否包含了页眉(如\"XX用户手册\")、页脚、页码等无关内容？\n"
         "    如果包含 → adjust，缩小 bbox 排除这些内容。</check>\n"
-        "  <check>【误检】该区域是否根本不是图片/图表？（纯文字段落、表格等）\n"
-        "    如果是误检 → reject。</check>\n"
+        "  <check>【误检】该区域是否完全是纯文字段落、没有任何图形元素？\n"
+        "    注意：包含图形+文字标注（如电路图旁的参数说明）不是误检，应 accept。\n"
+        "    只有100%纯文字且完全没有图形元素时 → reject。</check>\n"
         "  <check>【碎片合并】多张裁切图是否是同一个更大图形的碎片？\n"
         "    例如：图1和图2分别只框了一幅大图的左半部分和右半部分。\n"
         "    如果是 → 对面积最大的那张使用 adjust 扩展到覆盖完整图形，其余碎片使用 reject。</check>\n"
         "  <check>【多图合一】一个框内是否包含了多个完全独立、不相关的图形？\n"
         "    如果是 → split。注意：同一个 Figure 的多个子图（如子图a、子图b）不需要拆分。</check>\n"
-        "  <check>【空白/装饰】裁切区域是否几乎全是空白，或者只是装饰性元素（logo、校徽、水印、装饰线）？→ reject。</check>\n"
-        "  <check>【占满整页】裁切区域是否覆盖了几乎整个页面且包含大量文字段落？→ reject。但如果页面本身就是一整张图 → accept。</check>\n"
-        "  <check>【极端比例】宽高比极端的窄条是否只是装饰线/分隔线？→ reject。但有意义的宽幅图表 → accept。</check>\n"
+        "  <check>【纯装饰】裁切区域是否只是公司logo、校徽、水印？→ reject。\n"
+        "    注意：能带图、电路图、简单示意图、公式图等有技术含义的内容不是装饰，应 accept。</check>\n"
         "</critical_checks>\n\n"
         "<available_actions>\n"
         "  accept — 裁切完整、无多余内容、无误检，保留原样\n"
@@ -387,14 +411,35 @@ def _ai_verify_crops(client, model, page_png_bytes, crop_results, page_num,
         ']\n'
         "坐标系: 归一化 [0,1000]，左上角(0,0)，右下角(1000,1000)。\n"
         "只输出 JSON 数组，不要其他文字。\n"
-        "</output_format>"
+        "</output_format>\n\n"
+        "<reasoning_guide>\n"
+        "  对每张裁切图，按顺序检查上面的每一条 check 规则，然后决定 action。\n"
+        "  特别注意：先对照原始页面全图看整体布局，再逐张评估裁切图。\n"
+        "  如果两张裁切图分别只覆盖了同一个大图的一部分，务必合并（adjust 大的 + reject 小的）。\n"
+        "</reasoning_guide>"
     )
     content.append({"type": "text", "text": prompt})
+
+    system_msg = (
+        "<role>你是一个专业的文档图片裁切质量审查员。</role>\n"
+        "<core_principle>保留优先：宁可多保留一张有疑问的裁切，也不要误删有信息价值的图表。</core_principle>\n"
+        "<principles>\n"
+        "  <p>对照原始页面全图判断每个裁切是否完整、准确</p>\n"
+        "  <p>发现碎片必须合并——一个完整的图/图表不应被拆成多个独立文件</p>\n"
+        "  <p>只有明确的装饰性元素（公司logo、校徽、水印）才应 reject</p>\n"
+        "  <p>包含图形+少量文字标注的裁切不是误检，应该 accept 或 adjust</p>\n"
+        "  <p>bbox 调整时要精确去除红色装饰边框、页眉页脚等无关区域</p>\n"
+        "  <p>只输出 JSON，不要解释</p>\n"
+        "</principles>"
+    )
 
     try:
         response = client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": content}],
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": content},
+            ],
             temperature=0.1 + round_num * 0.1,
             max_tokens=2048,
             extra_body={"enable_thinking": False},
@@ -510,7 +555,7 @@ def _execute_crop_actions(page_png_bytes, actions, crop_results, page_num, image
 def _ai_verify_and_refine_crops(client, model, page_png_bytes, crop_results,
                                 page_num, images_dir, *,
                                 max_rounds=MAX_CROP_VERIFY_ROUNDS,
-                                other_images=None):
+                                other_images=None, doc_context=""):
     """AI 验证 + 优化裁切结果的主循环。"""
     for round_num in range(max_rounds):
         if not crop_results:
@@ -519,7 +564,7 @@ def _ai_verify_and_refine_crops(client, model, page_png_bytes, crop_results,
         actions = _ai_verify_crops(
             client, model, page_png_bytes, crop_results,
             page_num, images_dir, round_num=round_num,
-            other_images=other_images,
+            other_images=other_images, doc_context=doc_context,
         )
 
         for a in actions:

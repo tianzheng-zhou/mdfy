@@ -248,13 +248,14 @@ def convert_page_with_ai(client, model, page_png_bytes, page_text, image_filenam
 
 
 def _detect_figures_for_page(client, model, page_png, page_num, images_dir,
-                             pdf_type, embedded_filenames=None):
+                             pdf_type, embedded_filenames=None, doc_context=""):
     """并行阶段：检测 + 裁切 + AI 验证单页的图表区域。无 fitz 依赖。
 
     返回 fig_results (list of (filename, desc, pixel_bbox)) 或 None。
     """
     try:
-        figures = detect_page_figures(client, model, page_png, page_num)
+        figures = detect_page_figures(client, model, page_png, page_num,
+                                     doc_context=doc_context)
     except Exception as e:
         print(f"  ⚠ 第{page_num+1}页图片检测失败: {e}")
         figures = []
@@ -270,6 +271,7 @@ def _detect_figures_for_page(client, model, page_png, page_num, images_dir,
         fig_results = _ai_verify_and_refine_crops(
             client, model, page_png, fig_results,
             page_num, str(images_dir),
+            doc_context=doc_context,
             **kwargs,
         )
     return fig_results if fig_results else None
@@ -278,7 +280,7 @@ def _detect_figures_for_page(client, model, page_png, page_num, images_dir,
 def _convert_page_vision(client, model, page_png_bytes, page_num, total_pages,
                          prev_md_tail="", outline="", page_image_mime="image/png",
                          image_filenames=None, image_positions=None,
-                         image_coverage=0):
+                         image_coverage=0, doc_context=""):
     """Vision 模式：纯视觉页面转换，完全依赖模型 OCR + 视觉理解。
 
     与 pipeline 模式的 convert_page_with_ai 类似，但不传文本层，
@@ -343,6 +345,8 @@ def _convert_page_vision(client, model, page_png_bytes, page_num, total_pages,
 
     # 组装 user_text
     sections = [f"  <page number=\"{page_num + 1}\" total=\"{total_pages}\"/>"]
+    if doc_context:
+        sections.append(f"  <document_context>{doc_context}</document_context>")
     if outline_section:
         sections.append(outline_section)
     sections.append(tail_section)

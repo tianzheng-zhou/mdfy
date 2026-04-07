@@ -29,6 +29,32 @@ from .stitch import _build_outline, _join_pages_smart
 from .postprocess import postprocess_markdown
 
 
+def _infer_document_context(client, model, first_page_bytes, first_page_mime):
+    """Phase A.5: 从首页快速推断文档全局上下文。"""
+    import base64 as _b64
+    prompt = (
+        "<task>用一句话概括这个文档的类型和主题。</task>\n"
+        "<output_format>直接输出一句话描述，不要其他内容。例如：\"这是一份关于模拟电路中MOSFET器件的大学课程讲义\"</output_format>"
+    )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {
+                    "url": f"data:{first_page_mime};base64,{_b64.b64encode(first_page_bytes).decode()}"
+                }},
+                {"type": "text", "text": prompt},
+            ]}],
+            temperature=0.0,
+            max_tokens=100,
+            extra_body={"enable_thinking": False},
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"  ⚠ 文档上下文推断失败: {e}")
+        return ""
+
+
 def _vision_mode_convert(pdf_path, output_dir, model, client):
     """Vision 模式主流程：渲染所有页面为图片 → AI 检测并裁切图表 → 纯视觉 AI 转换。
 
@@ -63,6 +89,14 @@ def _vision_mode_convert(pdf_path, output_dir, model, client):
 
     doc.close()
 
+    # ── Phase A.5: 推断文档上下文 ──
+    doc_context = _infer_document_context(
+        client, model,
+        page_data[0]['page_api_image'], page_data[0]['page_api_mime']
+    )
+    if doc_context:
+        print(f"  文档上下文: {doc_context}", flush=True)
+
     # ── Phase B: 并行图片检测 + 裁切（复用 pipeline 的检测管线）──
     print(f"  Vision Phase B: 并行检测图表...", flush=True)
     page_figures = {}  # page_num -> fig_results
@@ -73,6 +107,7 @@ def _vision_mode_convert(pdf_path, output_dir, model, client):
                 _detect_figures_for_page,
                 client, model, pd['page_png'], pd['page_num'],
                 images_dir, "scanned",  # 视觉模式等同扫描件：无嵌入图
+                None, doc_context,
             )
             futures[pd['page_num']] = fut
 
@@ -174,6 +209,7 @@ def _vision_mode_convert(pdf_path, output_dir, model, client):
                 image_filenames=image_filenames,
                 image_positions=image_positions,
                 image_coverage=img_coverage,
+                doc_context=doc_context,
             )
             if not md_part or not md_part.strip():
                 print(f"⚠空 ({time.time() - start:.1f}s) 模型返回空内容")
@@ -195,6 +231,7 @@ def _vision_mode_convert(pdf_path, output_dir, model, client):
                             image_filenames=image_filenames,
                             image_positions=image_positions,
                             image_coverage=img_coverage,
+                            doc_context=doc_context,
                         )
                         if md_part2 and md_part2.strip():
                             issues2, qscore2 = _model_review_page_quality(
