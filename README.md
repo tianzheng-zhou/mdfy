@@ -24,7 +24,9 @@ pip install -r requirements.txt
 
 ### 2. 配置 API Key
 
-本项目使用阿里云 DashScope 的 OpenAI 兼容端点：
+本项目支持两套 provider，根据选用的模型名自动路由：
+
+#### DashScope（默认 Qwen 模型，模型名无前缀）
 
 ```bash
 # Windows PowerShell
@@ -34,11 +36,27 @@ $env:DASHSCOPE_API_KEY = "sk-xxxxx"
 export DASHSCOPE_API_KEY=sk-xxxxx
 ```
 
+#### 本地 Gemini 聚合代理（模型名以 `gemini/` 开头）
+
+```bash
+# Windows PowerShell
+$env:GEMINI_PROXY_API_KEY = "sk-xxxxx"
+$env:GEMINI_PROXY_BASE_URL = "http://127.0.0.1:8045"   # 可选，默认值
+
+# Linux / macOS
+export GEMINI_PROXY_API_KEY=sk-xxxxx
+export GEMINI_PROXY_BASE_URL=http://127.0.0.1:8045
+```
+
 或在项目根目录创建 `.env`：
 
 ```
 DASHSCOPE_API_KEY=sk-xxxxx
+GEMINI_PROXY_API_KEY=sk-xxxxx
+GEMINI_PROXY_BASE_URL=http://127.0.0.1:8045
 ```
+
+只用其中一套时，另一套的 Key 不需要配置——会惰性校验。
 
 ### 3. 运行
 
@@ -66,10 +84,10 @@ python -m mdfy <pdf_path> [-m MODEL] [-o DIR]
 | 参数 | 说明 |
 |------|------|
 | `pdf_path` | 要转换的 PDF 文件路径 |
-| `-m`, `--model` | 模型：`qwen3.5-plus`（默认）/ `qwen3.5-flash` / `qwen3.6-plus` |
+| `-m`, `--model` | 模型：`qwen3.5-plus`（默认）/ `qwen3.5-flash` / `qwen3.6-plus` / `gemini/gemini-3.1-pro-high` |
 | `-o`, `--output` | 输出目录（默认：PDF 同目录下的同名文件夹） |
 
-跨页拼接（stitch）固定使用 `qwen3.5-flash`——仅处理文本，不需要视觉能力。
+跨页拼接（stitch）使用与主转换相同的模型，避免同时配置多套 API Key。
 
 ## 输出结构
 
@@ -102,7 +120,8 @@ WEB_PORT=23504      # 端口号（默认 23504）
 |------|------|
 | `qwen3.5-plus` | **默认推荐**。视觉 OCR + 版面理解最稳定 |
 | `qwen3.5-flash` | 速度快、成本低。小字/公式识别略弱 |
-| `qwen3.6-plus` | 新一代模型，能力更强（可用时推荐） |
+| `qwen3.6-plus` | 新一代 Qwen 模型，能力更强（可用时推荐） |
+| `gemini/gemini-3.1-pro-high` | 通过本地聚合代理调用 Gemini 协议的模型；需自行启动代理（默认 `127.0.0.1:8045`）。模型名前缀 `gemini/` 触发路由 |
 
 ## 技术架构
 
@@ -162,6 +181,7 @@ mdfy/
 |----|------|
 | [PyMuPDF](https://pymupdf.readthedocs.io/) | PDF 打开与页面渲染 |
 | [openai](https://github.com/openai/openai-python) | 调用 DashScope 兼容端点 |
+| [google-generativeai](https://github.com/google/generative-ai-python) | 调用 Gemini 协议的本地聚合代理 |
 | [Pillow](https://pillow.readthedocs.io/) | 图像压缩、bbox 绘制 |
 | [numpy](https://numpy.org/) | 裁切像素级空白判定 |
 | [python-dotenv](https://github.com/theskumar/python-dotenv) | 从 .env 加载环境变量 |

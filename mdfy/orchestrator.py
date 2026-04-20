@@ -60,7 +60,7 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
                 pass
     images_dir.mkdir(parents=True, exist_ok=True)
 
-    client = get_client()
+    client = get_client(model)
     doc = fitz.open(str(pdf_path))
     total_pages = len(doc)
 
@@ -235,7 +235,7 @@ def pdf_to_markdown_ai(pdf_path, output_dir=None, model=None):
     # Phase F: 跨页 LLM 拼接
     # ══════════════════════════════════════════════════════════════════
     print(f"\n  拼接 {len(all_md_parts)} 页...", end="", flush=True)
-    md_content = join_pages_smart(all_md_parts, client=client)
+    md_content = join_pages_smart(all_md_parts, client=client, stitch_model=model)
 
     # 内容完整性回退：stitch 若丢了整页图片引用，回退到纯 \n\n 拼接
     missing_pages = []

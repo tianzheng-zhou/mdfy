@@ -1,5 +1,6 @@
 PyMuPDF>=1.24
 openai>=1.40
+google-generativeai>=0.8
 Pillow>=10
 numpy>=1.26
 python-dotenv>=1.0

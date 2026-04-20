@@ -12,7 +12,7 @@ from collections import defaultdict
 
 from .config import (
     DETECTION_IMAGE_MAX_SIDE, OCR_IMAGE_MAX_SIDE, VERIFY_CROP_MAX_SIDE,
-    MAX_CROP_VERIFY_ROUNDS,
+    MAX_CROP_VERIFY_ROUNDS, is_gemini_model,
 )
 from .pdf_render import (
     prepare_image_for_model, bbox_to_pixels, encode_data_url,
@@ -155,12 +155,14 @@ def detect_page_figures(client, model, page_png_bytes, page_num, doc_context="")
             print(f"  ⚠ 第{page_num+1}页 JSON 检测尝试{attempt+1}失败: {e}")
 
     # ── Path 2: qwenvl markdown 检测 ──
+    # Qwen-VL 专属的 "qwenvl markdown" magic prompt；非 Qwen provider 时跳过以省一次调用
     qwenvl_figures = []
-    try:
-        raw_qwenvl = request_qwenvl_markdown(client, model, detect_bytes, detect_mime)
-        qwenvl_figures = parse_qwenvl_markdown_figures(raw_qwenvl, detect_size)
-    except Exception as e:
-        print(f"  ⚠ 第{page_num+1}页 qwenvl 检测失败: {e}")
+    if not is_gemini_model(model):
+        try:
+            raw_qwenvl = request_qwenvl_markdown(client, model, detect_bytes, detect_mime)
+            qwenvl_figures = parse_qwenvl_markdown_figures(raw_qwenvl, detect_size)
+        except Exception as e:
+            print(f"  ⚠ 第{page_num+1}页 qwenvl 检测失败: {e}")
 
     # ── Fallback: 双路都空时用更宽松的 prompt ──
     if not json_figures and not qwenvl_figures:

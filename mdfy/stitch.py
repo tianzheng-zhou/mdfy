@@ -2,7 +2,7 @@
 
 import re
 
-from .config import STITCH_MODEL, STITCH_PREV_TAIL_CHARS, OUTLINE_MAX_HEADINGS
+from .config import STITCH_PREV_TAIL_CHARS, OUTLINE_MAX_HEADINGS
 from .prompts import STITCH_SYSTEM
 
 
@@ -207,11 +207,14 @@ def dedup_page_boundary(prev_text, curr_text):
 # LLM 拼接
 # ══════════════════════════════════════════════════════════════════════
 
-def stitch_boundary_with_llm(client, prev_tail, curr_head, stitch_model=STITCH_MODEL):
+def stitch_boundary_with_llm(client, prev_tail, curr_head, stitch_model):
     """调用轻量 LLM 修正下一页开头（去重 + 续接）。
 
+    `stitch_model` 由 orchestrator 传入（与主转换模型一致，避免多 provider Key）。
     返回修正后的 curr_head，或 None 表示失败/被拒。
     """
+    if not stitch_model:
+        return None
     user_msg = (
         f"<page_end>\n{prev_tail}\n</page_end>\n\n"
         f"<page_start>\n{curr_head}\n</page_start>"
@@ -276,13 +279,15 @@ def stitch_boundary_with_llm(client, prev_tail, curr_head, stitch_model=STITCH_M
 # 智能拼接主流程
 # ══════════════════════════════════════════════════════════════════════
 
-def join_pages_smart(parts, client=None):
+def join_pages_smart(parts, client=None, stitch_model=None):
     """智能拼接多页 Markdown 输出。
 
     策略分三层：
     1. 快速判断：边界干净 → 直接 \\n\\n 拼接（或表格续接 \\n）
-    2. LLM 拼接：边界有问题 → 调用 flash 模型合并
+    2. LLM 拼接：边界有问题 → 调用 `stitch_model` 合并
     3. 正则回退：LLM 不可用时用 dedup_page_boundary + is_continuation_start
+
+    `stitch_model` 为 None 时直接跳过 LLM 拼接层。
     """
     if not parts:
         return ""
@@ -316,9 +321,9 @@ def join_pages_smart(parts, client=None):
         curr_rest = curr[boundary_chars:] if len(curr) > boundary_chars else ""
 
         # LLM 拼接
-        if client is not None:
+        if client is not None and stitch_model:
             stitch_count += 1
-            stitched = stitch_boundary_with_llm(client, prev_tail, curr_head)
+            stitched = stitch_boundary_with_llm(client, prev_tail, curr_head, stitch_model)
             if stitched is not None:
                 corrected_curr = stitched + curr_rest
                 if is_incomplete_sentence(prev):

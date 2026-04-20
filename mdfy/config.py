@@ -1,10 +1,19 @@
 """全局常量与模型配置。纯视觉版：无 pipeline/vision 模式区分。"""
 
-AVAILABLE_MODELS = ["qwen3.5-flash", "qwen3.5-plus", "qwen3.6-plus"]
+# 模型名以 "gemini/" 前缀开头 → 走本地 Gemini 聚合代理
+# 其他（裸名）→ 走阿里云 DashScope（OpenAI 兼容端点）
+AVAILABLE_MODELS = [
+    "qwen3.5-flash",
+    "qwen3.5-plus",
+    "qwen3.6-plus",
+    "gemini/gemini-3.1-pro-high",
+]
 DEFAULT_MODEL = "qwen3.5-plus"
 
-# 拼接用的轻量模型（文本 only，不需要视觉能力）
-STITCH_MODEL = "qwen3.5-flash"
+
+def is_gemini_model(model_name: str) -> bool:
+    """判断一个模型名是否走 Gemini 代理。"""
+    return isinstance(model_name, str) and model_name.startswith("gemini/")
 
 # 页面渲染 DPI；纯视觉模式下拉高可提升小字/公式 OCR
 RENDER_DPI = 220
