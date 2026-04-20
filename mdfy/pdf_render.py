@@ -1,4 +1,7 @@
-"""PDF 工具函数：渲染、文本提取、图片压缩、bbox 转换。"""
+"""PDF 渲染、图像压缩、bbox 归一化与检测响应解析。
+
+纯视觉版：fitz 只用于打开 PDF + 渲染为 PNG。无文本层提取、无 PDF 类型检测。
+"""
 
 import base64
 import io
@@ -6,15 +9,19 @@ import re
 
 import fitz
 
-from .config import MODEL_IMAGE_MAX_BYTES, MIN_MODEL_IMAGE_SIDE
+from .config import MODEL_IMAGE_MAX_BYTES, MIN_MODEL_IMAGE_SIDE, RENDER_DPI
 
 
-def render_page_to_image(page, dpi=200):
-    """将 PDF 页面渲染为 PNG 字节"""
+# ── 渲染 ─────────────────────────────────────────────────────────────
+
+def render_page_to_image(page, dpi=RENDER_DPI):
+    """将 PDF 页面渲染为 PNG 字节。"""
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     pix = page.get_pixmap(matrix=mat)
     return pix.tobytes("png")
 
+
+# ── 图像压缩 ─────────────────────────────────────────────────────────
 
 def _serialize_pil_image(image, fmt, **save_kwargs):
     buffer = io.BytesIO()
@@ -27,7 +34,7 @@ def prepare_image_for_model(image_bytes, *, max_side, max_bytes=MODEL_IMAGE_MAX_
     """将图片压缩到适合发送给视觉模型的尺寸与体积。
 
     返回 (encoded_bytes, mime_type, (width, height))。
-    优先保留 PNG；若体积仍过大，则降尺度并回退到 JPEG。
+    优先保留 PNG；若体积仍过大则降尺度并回退到 JPEG。
     """
     from PIL import Image
 
@@ -37,10 +44,7 @@ def prepare_image_for_model(image_bytes, *, max_side, max_bytes=MODEL_IMAGE_MAX_
     if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
 
-    if hasattr(Image, "Resampling"):
-        resample = Image.Resampling.LANCZOS
-    else:
-        resample = Image.LANCZOS
+    resample = getattr(Image, "Resampling", Image).LANCZOS
 
     current = image
     current_max_side = min(max(image.size), max_side)
@@ -64,10 +68,7 @@ def prepare_image_for_model(image_bytes, *, max_side, max_bytes=MODEL_IMAGE_MAX_
         smallest_jpeg = None
         for quality in (90, 85, 80, 75, 70, 60, 50, 40):
             jpeg_bytes = _serialize_pil_image(
-                jpeg_source,
-                "JPEG",
-                quality=quality,
-                optimize=True,
+                jpeg_source, "JPEG", quality=quality, optimize=True,
             )
             if smallest_jpeg is None or len(jpeg_bytes) < len(smallest_jpeg):
                 smallest_jpeg = jpeg_bytes
@@ -85,16 +86,17 @@ def prepare_image_for_model(image_bytes, *, max_side, max_bytes=MODEL_IMAGE_MAX_
         current_max_side = next_max_side
 
 
-def extract_page_text(page):
-    """提取页面的纯文本"""
-    return page.get_text().strip()
+def encode_data_url(image_bytes, mime):
+    """把图像字节编码为 data URL，供 OpenAI image_url 字段使用。"""
+    return f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
 
+
+# ── bbox 坐标 ────────────────────────────────────────────────────────
 
 def bbox_to_pixels(bbox, image_width, image_height):
     """将 bbox 转为像素坐标。
 
-    优先按官方定位能力常见的归一化坐标 [0, 1000] 解释；
-    若超出范围，则回退为绝对像素坐标，兼容旧测试输出。
+    优先按归一化坐标 [0, 1000] 解释；若超出范围则回退为绝对像素。
     """
     x1, y1, x2, y2 = [float(v) for v in bbox]
 
@@ -114,7 +116,7 @@ def bbox_to_pixels(bbox, image_width, image_height):
     return x1, y1, x2, y2
 
 
-def _normalize_bbox_to_1000(bbox, image_size, *, from_pixels=False):
+def normalize_bbox_to_1000(bbox, image_size, *, from_pixels=False):
     """统一将 bbox 转为 [0, 1000] 归一化坐标。"""
     x1, y1, x2, y2 = [float(v) for v in bbox]
 
@@ -135,8 +137,10 @@ def _normalize_bbox_to_1000(bbox, image_size, *, from_pixels=False):
     ]
 
 
+# ── 检测响应解析 ─────────────────────────────────────────────────────
+
 def parse_figure_detection_response(raw_text, image_size):
-    """解析模型返回的 JSON 检测结果，兼容 bbox / bbox_2d。"""
+    """解析模型返回的 JSON 检测结果，兼容 bbox / bbox_2d 两种字段名。"""
     import json
 
     raw = raw_text.strip()
@@ -161,7 +165,6 @@ def parse_figure_detection_response(raw_text, image_size):
             bbox_key = "bbox"
         elif "bbox_2d" in item:
             bbox_key = "bbox_2d"
-
         if bbox_key is None:
             continue
 
@@ -172,7 +175,7 @@ def parse_figure_detection_response(raw_text, image_size):
             continue
 
         figures.append({
-            "bbox": _normalize_bbox_to_1000(
+            "bbox": normalize_bbox_to_1000(
                 bbox,
                 image_size,
                 from_pixels=(bbox_key == "bbox_2d"),
@@ -184,7 +187,7 @@ def parse_figure_detection_response(raw_text, image_size):
 
 
 def parse_qwenvl_markdown_figures(raw_text, image_size):
-    """解析 qwenvl markdown 中的图片坐标注释。"""
+    """解析 qwenvl markdown 模式输出中的 `<!-- Image (x,y,w,h) -->` 坐标注释。"""
     raw = raw_text.strip()
     raw = re.sub(r'^```(?:markdown)?\s*', '', raw)
     raw = re.sub(r'\s*```$', '', raw)
@@ -192,15 +195,15 @@ def parse_qwenvl_markdown_figures(raw_text, image_size):
     figures = []
     seen = set()
     for match in re.finditer(r'<!--\s*Image\s*\(([^)]+)\)\s*-->', raw, flags=re.IGNORECASE):
-        parts = [part.strip() for part in match.group(1).split(',')]
+        parts = [p.strip() for p in match.group(1).split(',')]
         if len(parts) != 4:
             continue
         try:
-            pixel_bbox = [float(part) for part in parts]
+            pixel_bbox = [float(p) for p in parts]
         except ValueError:
             continue
 
-        norm_bbox = _normalize_bbox_to_1000(pixel_bbox, image_size, from_pixels=True)
+        norm_bbox = normalize_bbox_to_1000(pixel_bbox, image_size, from_pixels=True)
         bbox_key = tuple(int(round(v)) for v in norm_bbox)
         if bbox_key in seen:
             continue
@@ -210,14 +213,13 @@ def parse_qwenvl_markdown_figures(raw_text, image_size):
     return figures
 
 
-def _request_qwenvl_markdown(client, model, image_bytes, image_mime):
+def request_qwenvl_markdown(client, model, image_bytes, image_mime):
+    """走 qwenvl 内置的 markdown 模式，用于抓取 `<!-- Image (...) -->` 坐标。"""
     response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "user", "content": [
-                {"type": "image_url", "image_url": {
-                    "url": f"data:{image_mime};base64,{base64.b64encode(image_bytes).decode()}"
-                }},
+                {"type": "image_url", "image_url": {"url": encode_data_url(image_bytes, image_mime)}},
                 {"type": "text", "text": "qwenvl markdown"},
             ]},
         ],
@@ -226,53 +228,3 @@ def _request_qwenvl_markdown(client, model, image_bytes, image_mime):
         extra_body={"enable_thinking": False},
     )
     return response.choices[0].message.content.strip()
-
-
-def _detect_pdf_type(doc):
-    """检测 PDF 类型：scanned（扫描件）或 digital（数字PDF）
-
-    扫描件特征：文本层为空 + 图片为页面扫描条带或整页图片
-    """
-    sample_count = min(5, len(doc))
-    text_chars = 0
-    scan_page_count = 0
-
-    for i in range(sample_count):
-        page = doc[i]
-        text_chars += len(page.get_text().strip())
-        if _is_scan_tile_page(page, doc):
-            scan_page_count += 1
-
-    if text_chars < 50 * sample_count and scan_page_count >= sample_count * 0.6:
-        return "scanned"
-    return "digital"
-
-
-def _is_scan_tile_page(page, doc):
-    """检测页面是否为扫描页（整页图或条带拼接）"""
-    imgs = page.get_images(full=True)
-    if not imgs:
-        return False
-
-    page_w_px = page.rect.width * 200 / 72
-
-    if len(imgs) == 1:
-        try:
-            pix = fitz.Pixmap(doc, imgs[0][0])
-            return pix.width > page_w_px * 0.8
-        except Exception:
-            return False
-
-    if len(imgs) >= 3:
-        try:
-            sizes = []
-            for img in imgs:
-                pix = fitz.Pixmap(doc, img[0])
-                sizes.append((pix.width, pix.height))
-            widths = set(s[0] for s in sizes)
-            heights = set(s[1] for s in sizes)
-            return len(widths) <= 1 and len(heights) <= 1
-        except Exception:
-            pass
-
-    return False

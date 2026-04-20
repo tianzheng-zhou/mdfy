@@ -1,5 +1,5 @@
 """
-PDF to Markdown — AI 增强转换 Demo 网站
+PDF → Markdown — AI 增强转换 Demo 网站
 Flask 后端：文件上传、后台转换、SSE 进度推送、结果预览 & 下载
 """
 
@@ -9,7 +9,6 @@ import socket
 import sys
 import uuid
 import time
-import shutil
 import zipfile
 import threading
 from datetime import datetime
@@ -20,8 +19,8 @@ from flask import (
     send_file, send_from_directory, Response,
 )
 
-from mdfy import pdf_to_markdown_ai, AVAILABLE_MODELS, DEFAULT_MODEL, AVAILABLE_MODES, DEFAULT_MODE
-from api import api_bp, init_api
+from mdfy import pdf_to_markdown_ai, AVAILABLE_MODELS, DEFAULT_MODEL
+
 
 # ── Flask 配置 ──────────────────────────────────────────────────────
 
@@ -30,6 +29,7 @@ app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
+
 
 # ── 任务管理 ────────────────────────────────────────────────────────
 
@@ -74,25 +74,12 @@ class TaskInfo:
 
 # ── 路由 ────────────────────────────────────────────────────────────
 
-# ── 注册 API Blueprint ──────────────────────────────────────────────
-init_api(tasks, UPLOAD_DIR)
-app.register_blueprint(api_bp)
-
-
-@app.route("/api/docs")
-def api_docs_page():
-    """API 文档页面"""
-    return render_template("api_docs.html")
-
-
 @app.route("/")
 def index():
     return render_template(
         "index.html",
         models=AVAILABLE_MODELS,
         default_model=DEFAULT_MODEL,
-        modes=AVAILABLE_MODES,
-        default_mode=DEFAULT_MODE,
     )
 
 
@@ -101,7 +88,6 @@ def upload():
     """接收 PDF 上传，启动后台转换"""
     file = request.files.get("pdf")
     model = request.form.get("model", DEFAULT_MODEL)
-    mode = request.form.get("mode", DEFAULT_MODE)
 
     if not file or not file.filename:
         return jsonify({"error": "请选择 PDF 文件"}), 400
@@ -109,14 +95,11 @@ def upload():
         return jsonify({"error": "仅支持 PDF 格式"}), 400
     if model not in AVAILABLE_MODELS:
         model = DEFAULT_MODEL
-    if mode not in AVAILABLE_MODES:
-        mode = DEFAULT_MODE
 
     task_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:12]
     task_dir = UPLOAD_DIR / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
 
-    # 安全文件名
     safe_name = Path(file.filename).name
     pdf_path = task_dir / safe_name
     file.save(str(pdf_path))
@@ -129,7 +112,7 @@ def upload():
         sys.stdout = task.log
         try:
             task.status = "converting"
-            result = pdf_to_markdown_ai(str(pdf_path), model=model, mode=mode)
+            result = pdf_to_markdown_ai(str(pdf_path), model=model)
             task.result_md = result
             task.output_dir = str(Path(result).parent)
             task.status = "done"
@@ -202,7 +185,6 @@ def serve_image(task_id: str, filename: str):
         return "Not found", 404
 
     images_dir = Path(task.output_dir) / "images"
-    # 防止路径穿越
     safe_name = Path(filename).name
     img_path = images_dir / safe_name
     if not img_path.exists() or not img_path.is_relative_to(images_dir):
@@ -221,10 +203,8 @@ def download_zip(task_id: str):
     output_dir = Path(task.output_dir)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        # Markdown 文件
         md_file = Path(task.result_md)
         zf.write(md_file, md_file.name)
-        # 图片目录
         images_dir = output_dir / "images"
         if images_dir.exists():
             for img in images_dir.iterdir():

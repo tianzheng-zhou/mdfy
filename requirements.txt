@@ -1,0 +1,6 @@
+PyMuPDF>=1.24
+openai>=1.40
+Pillow>=10
+numpy>=1.26
+python-dotenv>=1.0
+Flask>=3.0
